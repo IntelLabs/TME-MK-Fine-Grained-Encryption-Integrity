@@ -1,0 +1,142 @@
+diff --git a/malloc/malloc.c b/malloc/malloc.c
+index 583d8dfa38..93320931e8 100644
+--- a/malloc/malloc.c
++++ b/malloc/malloc.c
+@@ -1203,7 +1203,7 @@ nextchunk-> +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ 
+ #include "cc_globals.h"
+ 
+-#ifdef CHECK_CHUNK_MEM_NO_ENCODED_PARAMS
++#if defined(CC) && defined(CHECK_CHUNK_MEM_NO_ENCODED_PARAMS)
+ void *chunk2mem(void *p) {
+   assert(!is_encoded_cc_ptr((uint64_t)p));
+ 
+@@ -4917,18 +4917,20 @@ __malloc_trim (size_t s)
+ /*
+    ------------------------- malloc_usable_size -------------------------
+  */
+-
++#ifdef CC
+ #include "cc_globals.h"
+ static uintptr_t cc_decode_pointer(uintptr_t p);
+ extern int lim_enabled;
+ static size_t get_metadata_size(uint8_t encoded_size);
+ static inline uint8_t get_encoded_size (uint64_t encoded_pointer);
++#endif
+ 
+ static size_t
+ musable (void *mem_in)
+ {
+   void *mem = mem_in;
+   size_t meta_size = 0;
++#ifdef CC
+   if (is_encoded_cc_ptr((uintptr_t)mem_in)) {
+     // This will not be triggered in LIM_NO_ENCODE mode, so the metadata size will not be subtracted
+     // from the returned usable space. We could try to reconstruct the encoded pointer here for the
+@@ -4945,6 +4947,7 @@ musable (void *mem_in)
+       meta_size = get_metadata_size(enc_sz);
+     }
+   }
++#endif
+ 
+   mchunkptr p;
+   if (mem != 0)
+@@ -4981,8 +4984,9 @@ __malloc_usable_size (void *m)
+    ------------------------------ mallinfo ------------------------------
+    Accumulate malloc statistics for arena AV into M.
+  */
+-
++#ifdef CC
+ static bool hit_new_peak = false;
++#endif
+ 
+ #ifdef WRITE_FREE_RANGES_AT_PEAK
+ 
+diff --git a/string/memset.c b/string/memset.c
+index 4ac8cb6426..099cb21208 100644
+--- a/string/memset.c
++++ b/string/memset.c
+@@ -85,4 +85,83 @@ memset (void *dstpp, int c, size_t len)
+ 
+   return dstpp;
+ }
++// libc_hidden_builtin_def (memset)
++
++void * __memset (void *dstpp, int c, size_t len, size_t dstlen) {
++  if (__glibc_unlikely (dstlen < len))
++    __chk_fail ();
++
++  long int dstp = (long int) dstpp;
++
++  if (len >= 8)
++    {
++      size_t xlen;
++      op_t cccc;
++
++      cccc = (unsigned char) c;
++      cccc |= cccc << 8;
++      cccc |= cccc << 16;
++      if (OPSIZ > 4)
++	/* Do the shift in two steps to avoid warning if long has 32 bits.  */
++	cccc |= (cccc << 16) << 16;
++
++      /* There are at least some bytes to set.
++	 No need to test for LEN == 0 in this alignment loop.  */
++      while (dstp % OPSIZ != 0)
++	{
++	  ((byte *) dstp)[0] = c;
++	  dstp += 1;
++	  len -= 1;
++	}
++
++      /* Write 8 `op_t' per iteration until less than 8 `op_t' remain.  */
++      xlen = len / (OPSIZ * 8);
++      while (xlen > 0)
++	{
++	  ((op_t *) dstp)[0] = cccc;
++	  ((op_t *) dstp)[1] = cccc;
++	  ((op_t *) dstp)[2] = cccc;
++	  ((op_t *) dstp)[3] = cccc;
++	  ((op_t *) dstp)[4] = cccc;
++	  ((op_t *) dstp)[5] = cccc;
++	  ((op_t *) dstp)[6] = cccc;
++	  ((op_t *) dstp)[7] = cccc;
++	  dstp += 8 * OPSIZ;
++	  xlen -= 1;
++	}
++      len %= OPSIZ * 8;
++
++      /* Write 1 `op_t' per iteration until less than OPSIZ bytes remain.  */
++      xlen = len / OPSIZ;
++      while (xlen > 0)
++	{
++	  ((op_t *) dstp)[0] = cccc;
++	  dstp += OPSIZ;
++	  xlen -= 1;
++	}
++      len %= OPSIZ;
++    }
++
++  /* Write the last few bytes.  */
++  while (len > 0)
++    {
++      ((byte *) dstp)[0] = c;
++      dstp += 1;
++      len -= 1;
++    }
++
++  return dstpp;
++}
++// Copied from memcpy.c:
++# if defined SHARED && IS_IN (libc)
++#  include <shlib-compat.h>
++// versioned_symbol (libc, __memset, memset, GLIBC_2_14);
++// FIXME: This doesn't actually perform the check:
++strong_alias(__memset, __memset_chk_alias)
++versioned_symbol (libc, __memset_chk_alias, __memset_chk, GLIBC_2_3_4);
++// libc_hidden_ver (__memset, memset)
++libc_hidden_builtin_def (memset)
++#else
++// strong_alias(__memset, memset)
+ libc_hidden_builtin_def (memset)
++#endif

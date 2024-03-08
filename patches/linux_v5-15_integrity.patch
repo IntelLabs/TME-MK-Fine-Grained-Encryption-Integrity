@@ -1,0 +1,4366 @@
+diff --git a/.gitignore b/.gitignore
+index 7afd412dadd2..4ebd4b7d52a1 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -161,3 +161,27 @@ x509.genkey
+ 
+ # Documentation toolchain
+ sphinx_*/
++
++#unused architectures
++arch/alpha
++arch/arc
++arch/arm
++arch/arm64
++arch/csky
++arch/h8300
++arch/hexagon
++arch/ia64
++arch/m68k
++arch/microblaze
++arch/mips
++arch/nds32
++arch/nios2
++arch/openrisc
++arch/parisc
++arch/powerpc
++arch/riscv
++arch/s390
++arch/sh
++arch/sparc
++arch/um
++arch/xtensa
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index d9830e7e1060..1191751c0c71 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -1508,14 +1508,19 @@ config X86_CPA_STATISTICS
+ 	  Expose statistics about the Change Page Attribute mechanism, which
+ 	  helps to determine the effectiveness of preserving large and huge
+ 	  page mappings when mapping protections are changed.
++ 
++config X86_MEM_ENCRYPT_COMMON
++	select ARCH_HAS_FORCE_DMA_UNENCRYPTED
++	select DYNAMIC_PHYSICAL_MASK
++	def_bool n
++
+ 
+ config AMD_MEM_ENCRYPT
+ 	bool "AMD Secure Memory Encryption (SME) support"
+ 	depends on X86_64 && CPU_SUP_AMD
+ 	select DMA_COHERENT_POOL
+-	select DYNAMIC_PHYSICAL_MASK
+ 	select ARCH_USE_MEMREMAP_PROT
+-	select ARCH_HAS_FORCE_DMA_UNENCRYPTED
++	select X86_MEM_ENCRYPT_COMMON
+ 	select INSTRUCTION_DECODER
+ 	select ARCH_HAS_RESTRICTED_VIRTIO_MEMORY_ACCESS
+ 	help
+@@ -1535,6 +1540,25 @@ config AMD_MEM_ENCRYPT_ACTIVE_BY_DEFAULT
+ 
+ 	  If set to N, then the encryption of system memory can be
+ 	  activated with the mem_encrypt=on command line option.
++ 
++config X86_INTEL_MKTME
++	bool "Intel Multi-Key Total Memory Encryption"
++	depends on X86_64 && CPU_SUP_INTEL && !KASAN
++	select X86_MEM_ENCRYPT_COMMON
++	select PAGE_EXTENSION
++	select KEYS
++	select ACPI_HMAT
++	help
++	  Say yes to enable support for Multi-Key Total Memory Encryption.
++	  This requires an Intel processor that has support of the feature.
++
++	  Multikey Total Memory Encryption (MKTME) is a technology that allows
++	  transparent memory encryption in upcoming Intel platforms.
++
++	  MKTME is built on top of TME. TME allows encryption of the entirety
++	  of system memory using a single key. MKTME allows having multiple
++	  encryption domains, each having own key -- different memory pages can
++	  be encrypted with different keys.
+ 
+ # Common NUMA Features
+ config NUMA
+@@ -2187,9 +2211,9 @@ config RANDOMIZE_MEMORY
+ 
+ 	   If unsure, say Y.
+ 
+-config RANDOMIZE_MEMORY_PHYSICAL_PADDING
++config MEMORY_PHYSICAL_PADDING
+ 	hex "Physical memory mapping padding" if EXPERT
+-	depends on RANDOMIZE_MEMORY
++	depends on RANDOMIZE_MEMORY || X86_INTEL_MKTME
+ 	default "0xa" if MEMORY_HOTPLUG
+ 	default "0x0"
+ 	range 0x1 0x40 if MEMORY_HOTPLUG
+diff --git a/arch/x86/entry/syscalls/syscall_32.tbl b/arch/x86/entry/syscalls/syscall_32.tbl
+index 960a021d543e..95a83c20ed6a 100644
+--- a/arch/x86/entry/syscalls/syscall_32.tbl
++++ b/arch/x86/entry/syscalls/syscall_32.tbl
+@@ -453,3 +453,4 @@
+ 446	i386	landlock_restrict_self	sys_landlock_restrict_self
+ 447	i386	memfd_secret		sys_memfd_secret
+ 448	i386	process_mrelease	sys_process_mrelease
++451	i386	encrypt_mprotect	sys_encrypt_mprotect
+diff --git a/arch/x86/entry/syscalls/syscall_64.tbl b/arch/x86/entry/syscalls/syscall_64.tbl
+index 18b5500ea8bf..2c018c97d6dc 100644
+--- a/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -370,6 +370,7 @@
+ 446	common	landlock_restrict_self	sys_landlock_restrict_self
+ 447	common	memfd_secret		sys_memfd_secret
+ 448	common	process_mrelease	sys_process_mrelease
++451	common	encrypt_mprotect	sys_encrypt_mprotect
+ 
+ #
+ # Due to a historical design error, certain syscalls are numbered differently
+diff --git a/arch/x86/include/asm/intel_pconfig.h b/arch/x86/include/asm/intel_pconfig.h
+index 994638ef171b..abfc0f140183 100644
+--- a/arch/x86/include/asm/intel_pconfig.h
++++ b/arch/x86/include/asm/intel_pconfig.h
+@@ -20,12 +20,17 @@ enum pconfig_leaf {
+ #define PCONFIG ".byte 0x0f, 0x01, 0xc5"
+ 
+ /* Defines and structure for MKTME_KEY_PROGRAM of PCONFIG instruction */
++#define MKTME_ANY_ACTIVATED_ALG	(1 << __ffs(mktme_algs) << 8)
+ 
+ /* mktme_key_program::keyid_ctrl COMMAND, bits [7:0] */
+ #define MKTME_KEYID_SET_KEY_DIRECT	0
+ #define MKTME_KEYID_SET_KEY_RANDOM	1
+-#define MKTME_KEYID_CLEAR_KEY		2
+-#define MKTME_KEYID_NO_ENCRYPT		3
++/*
++ * CLEAR_KEY and NO_ENCRYPT require the COMMAND in bits [7:0]
++ * and any activated encryption algorithm, ENC_ALG, in bits [23:8]
++ */
++#define MKTME_KEYID_CLEAR_KEY  (2 | MKTME_ANY_ACTIVATED_ALG)
++#define MKTME_KEYID_NO_ENCRYPT (3 | MKTME_ANY_ACTIVATED_ALG)
+ 
+ /* mktme_key_program::keyid_ctrl ENC_ALG, bits [23:8] */
+ #define MKTME_AES_XTS_128	(1 << 8)
+diff --git a/arch/x86/include/asm/mem_encrypt.h b/arch/x86/include/asm/mem_encrypt.h
+index 9c80c68d75b5..705eb1baf866 100644
+--- a/arch/x86/include/asm/mem_encrypt.h
++++ b/arch/x86/include/asm/mem_encrypt.h
+@@ -56,7 +56,18 @@ bool sev_es_active(void);
+ 
+ #define __bss_decrypted __section(".bss..decrypted")
+ 
++/*
++ * The __sme_set() and __sme_clr() macros are useful for adding or removing
++ * the encryption mask from a value (e.g. when dealing with pagetable
++ * entries).
++ */
++#define __sme_set(x)		((x) | sme_me_mask)
++#define __sme_clr(x)		((x) & ~sme_me_mask)
++
+ #else	/* !CONFIG_AMD_MEM_ENCRYPT */
++ 
++#define __sme_set(x)		(x)
++#define __sme_clr(x)		(x)
+ 
+ #define sme_me_mask	0ULL
+ 
+@@ -113,4 +124,22 @@ static inline u64 sme_get_me_mask(void)
+ 
+ #endif	/* __ASSEMBLY__ */
+ 
++#ifdef CONFIG_X86_MEM_ENCRYPT_COMMON
++
++extern dma_addr_t __mem_encrypt_dma_set(dma_addr_t daddr, phys_addr_t paddr);
++extern phys_addr_t __mem_encrypt_dma_clear(phys_addr_t paddr);
++
++#else
++static inline dma_addr_t __mem_encrypt_dma_set(dma_addr_t daddr, phys_addr_t paddr)
++{
++	return daddr;
++}
++
++static inline phys_addr_t __mem_encrypt_dma_clear(phys_addr_t paddr)
++{
++	return paddr;
++}
++#endif /* CONFIG_X86_MEM_ENCRYPT_COMMON */
++
++
+ #endif	/* __X86_MEM_ENCRYPT_H__ */
+diff --git a/arch/x86/include/asm/mktme.h b/arch/x86/include/asm/mktme.h
+new file mode 100644
+index 000000000000..8564dad46450
+--- /dev/null
++++ b/arch/x86/include/asm/mktme.h
+@@ -0,0 +1,96 @@
++#ifndef	_ASM_X86_MKTME_H
++#define	_ASM_X86_MKTME_H
++
++#include <linux/types.h>
++#include <linux/page_ext.h>
++#include <linux/jump_label.h>
++
++struct vm_area_struct;
++
++#ifdef CONFIG_X86_INTEL_MKTME
++extern phys_addr_t __mktme_keyid_mask;
++extern phys_addr_t mktme_keyid_mask(void);
++extern int __mktme_keyid_shift;
++extern int mktme_keyid_shift(void);
++extern int __mktme_nr_keyids;
++extern int mktme_nr_keyids(void);
++extern unsigned int mktme_algs;
++
++/* Set the encryption keyid bits in a VMA */
++extern void mprotect_set_encrypt(struct vm_area_struct *vma, int newkeyid,
++				unsigned long start, unsigned long end, unsigned long mprotect_fixup_flags);
++
++/* MTKME encrypt_count for VMAs */
++extern struct percpu_ref *encrypt_count;
++extern void vma_get_encrypt_ref(struct vm_area_struct *vma);
++extern void vma_put_encrypt_ref(struct vm_area_struct *vma);
++
++DECLARE_STATIC_KEY_FALSE(mktme_enabled_key);
++static inline bool mktme_enabled(void)
++{
++	return static_branch_unlikely(&mktme_enabled_key);
++}
++
++void mktme_disable(void);
++
++extern struct page_ext_operations page_mktme_ops;
++
++#define page_keyid page_keyid
++static inline int page_keyid(const struct page *page)
++{
++	if (!mktme_enabled())
++		return 0;
++
++	return lookup_page_ext(page)->keyid;
++}
++
++#define vma_keyid vma_keyid
++int __vma_keyid(struct vm_area_struct *vma);
++static inline int vma_keyid(struct vm_area_struct *vma)
++{
++	if (!mktme_enabled())
++		return 0;
++
++	return __vma_keyid(vma);
++}
++
++#define prep_encrypted_page prep_encrypted_page
++void __prep_encrypted_page(struct page *page, int order, int keyid, bool zero);
++static inline void prep_encrypted_page(struct page *page, int order,
++		int keyid, bool zero)
++{
++	if (keyid)
++		__prep_encrypted_page(page, order, keyid, zero);
++}
++
++#define HAVE_ARCH_FREE_PAGE
++void free_encrypted_page(struct page *page, int order);
++static inline void arch_free_page(struct page *page, int order)
++{
++	if (page_keyid(page))
++		free_encrypted_page(page, order);
++}
++
++int sync_direct_mapping(unsigned long start, unsigned long end);
++
++#else
++#define mktme_keyid_mask()	((phys_addr_t)0)
++#define mktme_nr_keyids()	0
++#define mktme_keyid_shift()	0
++
++#define page_keyid(page) 0
++
++static inline bool mktme_enabled(void)
++{
++	return false;
++}
++
++static inline void mktme_disable(void) {}
++
++static inline int sync_direct_mapping(unsigned long start, unsigned long end)
++{
++	return 0;
++}
++#endif
++
++#endif
+diff --git a/arch/x86/include/asm/msr-index.h b/arch/x86/include/asm/msr-index.h
+index a7c413432b33..b06a9eab3e24 100644
+--- a/arch/x86/include/asm/msr-index.h
++++ b/arch/x86/include/asm/msr-index.h
+@@ -900,6 +900,32 @@
+ /* Geode defined MSRs */
+ #define MSR_GEODE_BUSCONT_CONF0		0x00001900
+ 
++/* MKTME MSRs */
++#define MSR_IA32_TME_ACTIVATE		0x00000982
++
++/* Helpers to access TME_ACTIVATE MSR */
++#define TME_ACTIVATE_LOCKED(x)		(x & 0x1)
++#define TME_ACTIVATE_ENABLED(x)		(x & 0x2)
++
++#define TME_BYPASS_POLICY(x)            (((x) >> 31) & 0x1)
++
++#define TME_ACTIVATE_POLICY(x)		((x >> 4) & 0xf)	/* Bits 7:4 */
++#define TME_ACTIVATE_POLICY_AES_XTS_128	0
++#define TME_ACTIVATE_POLICY_AES_XTS_128_I	1
++#define TME_ACTIVATE_POLICY_AES_XTS_256	2
++
++#define TME_ACTIVATE_KEYID_BITS(x)	((x >> 32) & 0xf)	/* Bits 35:32 */
++
++#define TME_ACTIVATE_CRYPTO_ALGS(x)	((x >> 48) & 0xffff)	/* Bits 63:48 */
++#define TME_ACTIVATE_CRYPTO_AES_XTS_128	1
++#define TME_ACTIVATE_CRYPTO_AES_XTS_128_I	2
++#define TME_ACTIVATE_CRYPTO_AES_XTS_256	4
++
++#define TME_ACTIVATE_CRYPTO_KNOWN_ALGS	( \
++					TME_ACTIVATE_CRYPTO_AES_XTS_128 | \
++					TME_ACTIVATE_CRYPTO_AES_XTS_128_I | \
++					TME_ACTIVATE_CRYPTO_AES_XTS_256)
++
+ /* Intel VT MSRs */
+ #define MSR_IA32_VMX_BASIC              0x00000480
+ #define MSR_IA32_VMX_PINBASED_CTLS      0x00000481
+diff --git a/arch/x86/include/asm/page.h b/arch/x86/include/asm/page.h
+index 4d5810c8fab7..6cbb195025db 100644
+--- a/arch/x86/include/asm/page.h
++++ b/arch/x86/include/asm/page.h
+@@ -19,6 +19,8 @@
+ struct page;
+ 
+ #include <linux/range.h>
++#include <asm/mktme.h>
++
+ extern struct range pfn_mapped[];
+ extern int nr_pfn_mapped;
+ 
+@@ -27,7 +29,7 @@ static inline void clear_user_page(void *page, unsigned long vaddr,
+ {
+ 	clear_page(page);
+ }
+-
++void copy_page(void *to, void *from);
+ static inline void copy_user_page(void *to, void *from, unsigned long vaddr,
+ 				  struct page *topage)
+ {
+@@ -71,6 +73,11 @@ static inline void copy_user_page(void *to, void *from, unsigned long vaddr,
+ extern bool __virt_addr_valid(unsigned long kaddr);
+ #define virt_addr_valid(kaddr)	__virt_addr_valid((unsigned long) (kaddr))
+ 
++#define page_to_virt_keyid(x, keyid) \
++	(__va(PFN_PHYS(page_to_pfn(x))) + (keyid) * direct_mapping_size)
++
++#define page_to_virt(x) page_to_virt_keyid(x, page_keyid(x))
++
+ #endif	/* __ASSEMBLY__ */
+ 
+ #include <asm-generic/memory_model.h>
+diff --git a/arch/x86/include/asm/page_32.h b/arch/x86/include/asm/page_32.h
+index 94dbd51df58f..8bce788f9ca9 100644
+--- a/arch/x86/include/asm/page_32.h
++++ b/arch/x86/include/asm/page_32.h
+@@ -6,6 +6,7 @@
+ 
+ #ifndef __ASSEMBLY__
+ 
++#define direct_mapping_size 0
+ #define __phys_addr_nodebug(x)	((x) - PAGE_OFFSET)
+ #ifdef CONFIG_DEBUG_VIRTUAL
+ extern unsigned long __phys_addr(unsigned long);
+diff --git a/arch/x86/include/asm/page_64.h b/arch/x86/include/asm/page_64.h
+index 4bde0dc66100..206bd6f85d29 100644
+--- a/arch/x86/include/asm/page_64.h
++++ b/arch/x86/include/asm/page_64.h
+@@ -14,6 +14,8 @@ extern unsigned long phys_base;
+ extern unsigned long page_offset_base;
+ extern unsigned long vmalloc_base;
+ extern unsigned long vmemmap_base;
++extern unsigned long direct_mapping_size;
++extern unsigned long direct_mapping_mask;
+ 
+ static inline unsigned long __phys_addr_nodebug(unsigned long x)
+ {
+@@ -22,7 +24,7 @@ static inline unsigned long __phys_addr_nodebug(unsigned long x)
+ 	/* use the carry flag to determine if x was < __START_KERNEL_map */
+ 	x = y + ((x > y) ? phys_base : (__START_KERNEL_map - PAGE_OFFSET));
+ 
+-	return x;
++	return x & direct_mapping_mask;
+ }
+ 
+ #ifdef CONFIG_DEBUG_VIRTUAL
+@@ -44,6 +46,32 @@ void clear_page_orig(void *page);
+ void clear_page_rep(void *page);
+ void clear_page_erms(void *page);
+ 
++
++#ifdef CONFIG_X86_INTEL_MKTME
++static inline void _movdir64b(void *dst, const void *src)
++{
++	// assert((uintptr_t)src == (uintptr_t)((uintptr_t)src & ~(64-1)));
++	// assert((uintptr_t)dst == (uintptr_t)((uintptr_t)dst & ~(64-1)));
++	const struct { char _[64]; } *__src = src;
++	struct { char _[64]; } *__dst = dst;
++
++	asm volatile(".byte 0x66, 0x0f, 0x38, 0xf8, 0x02"
++		     : "+m" (*__dst)
++		     :  "m" (*__src), "a" (__dst), "d" (__src));
++}
++static inline void clear_page(void *page)
++{
++	uint8_t* dst = (uint8_t*)page;
++	uint32_t block = 0;
++	__attribute__((aligned(64))) const uint8_t ZeroBlock[64] = { 0 };
++	asm volatile("mfence");
++	for (block = 0; block < (4096 / 64); block++) {
++		_movdir64b(dst, ZeroBlock);
++		dst += 64;
++	}
++	asm volatile("mfence");
++}
++#else
+ static inline void clear_page(void *page)
+ {
+ 	alternative_call_2(clear_page_orig,
+@@ -53,8 +81,25 @@ static inline void clear_page(void *page)
+ 			   "0" (page)
+ 			   : "cc", "memory", "rax", "rcx");
+ }
++#endif
+ 
+-void copy_page(void *to, void *from);
++#if defined(CONFIG_X86_INTEL_MKTME)
++static inline void copy_page(void *to, void* from)
++{
++	uint8_t* dst = (uint8_t*)to;
++	uint8_t* src = (uint8_t*)from;
++	uint32_t block = 0;
++	asm volatile("mfence");
++	for (block = 0; block < (4096 / 64); block++) {
++		_movdir64b(dst, src);
++		dst += 64;
++		src += 64;
++	}
++	asm volatile("mfence");
++}
++#else
++void copy_page_orig(void *to, void *from);
++#endif
+ 
+ #ifdef CONFIG_X86_5LEVEL
+ /*
+diff --git a/arch/x86/include/asm/pgtable.h b/arch/x86/include/asm/pgtable.h
+index 448cd01eb3ec..e8ec3655c129 100644
+--- a/arch/x86/include/asm/pgtable.h
++++ b/arch/x86/include/asm/pgtable.h
+@@ -814,6 +814,19 @@ static inline unsigned long pmd_page_vaddr(pmd_t pmd)
+  * to linux/mm.h:page_to_nid())
+  */
+ #define mk_pte(page, pgprot)   pfn_pte(page_to_pfn(page), (pgprot))
++ 
++#define mk_zero_pte mk_zero_pte
++static inline pte_t mk_zero_pte(unsigned long addr, pgprot_t prot)
++{
++	extern unsigned long zero_pfn;
++	pte_t entry;
++
++	prot.pgprot &= ~mktme_keyid_mask();
++	entry = pfn_pte(zero_pfn, prot);
++	entry = pte_mkspecial(entry);
++
++	return entry;
++}
+ 
+ static inline int pmd_bad(pmd_t pmd)
+ {
+@@ -1079,6 +1092,13 @@ static inline void ptep_set_wrprotect(struct mm_struct *mm,
+ #define flush_tlb_fix_spurious_fault(vma, address) do { } while (0)
+ 
+ #define mk_pmd(page, pgprot)   pfn_pmd(page_to_pfn(page), (pgprot))
++ 
++#define mk_zero_pmd(zero_page, prot)					\
++({									\
++	prot.pgprot &= ~mktme_keyid_mask();				\
++	pmd_mkhuge(mk_pmd(zero_page, prot));				\
++})
++
+ 
+ #define  __HAVE_ARCH_PMDP_SET_ACCESS_FLAGS
+ extern int pmdp_set_access_flags(struct vm_area_struct *vma,
+diff --git a/arch/x86/include/asm/pgtable_types.h b/arch/x86/include/asm/pgtable_types.h
+index 40497a9020c6..44b732f910d5 100644
+--- a/arch/x86/include/asm/pgtable_types.h
++++ b/arch/x86/include/asm/pgtable_types.h
+@@ -123,7 +123,9 @@
+  * instance, and is *not* included in this mask since
+  * pte_modify() does modify it.
+  */
+-#define _PAGE_CHG_MASK	(PTE_PFN_MASK | _PAGE_PCD | _PAGE_PWT |		\
++#define PTE_PFN_MASK_MAX \
++	(((signed long)PAGE_MASK) & ((1ULL << __PHYSICAL_MASK_SHIFT) - 1))
++#define _PAGE_CHG_MASK	(PTE_PFN_MASK_MAX | _PAGE_PCD | _PAGE_PWT |		\
+ 			 _PAGE_SPECIAL | _PAGE_ACCESSED | _PAGE_DIRTY |	\
+ 			 _PAGE_SOFT_DIRTY | _PAGE_DEVMAP | _PAGE_ENC |  \
+ 			 _PAGE_UFFD_WP)
+diff --git a/arch/x86/include/asm/setup.h b/arch/x86/include/asm/setup.h
+index a12458a7a8d4..0a24781a067b 100644
+--- a/arch/x86/include/asm/setup.h
++++ b/arch/x86/include/asm/setup.h
+@@ -65,6 +65,12 @@ extern void x86_ce4100_early_setup(void);
+ #else
+ static inline void x86_ce4100_early_setup(void) { }
+ #endif
++ 
++#ifdef CONFIG_MEMORY_PHYSICAL_PADDING
++void calculate_direct_mapping_size(void);
++#else
++static inline void calculate_direct_mapping_size(void) { }
++#endif
+ 
+ #ifndef _SETUP
+ 
+diff --git a/arch/x86/kernel/cpu/intel.c b/arch/x86/kernel/cpu/intel.c
+index 8321c43554a1..4ff787199c84 100644
+--- a/arch/x86/kernel/cpu/intel.c
++++ b/arch/x86/kernel/cpu/intel.c
+@@ -181,6 +181,8 @@ static bool bad_spectre_microcode(struct cpuinfo_x86 *c)
+ 	return false;
+ }
+ 
++static void detect_tme(struct cpuinfo_x86 *c);
++
+ static void early_init_intel(struct cpuinfo_x86 *c)
+ {
+ 	u64 misc_enable;
+@@ -332,6 +334,9 @@ static void early_init_intel(struct cpuinfo_x86 *c)
+ 	 */
+ 	if (detect_extended_topology_early(c) < 0)
+ 		detect_ht_early(c);
++
++	if (cpu_has(c, X86_FEATURE_TME))
++		detect_tme(c);
+ }
+ 
+ static void bsp_init_intel(struct cpuinfo_x86 *c)
+@@ -492,19 +497,16 @@ static void srat_detect_node(struct cpuinfo_x86 *c)
+ #endif
+ }
+ 
+-#define MSR_IA32_TME_ACTIVATE		0x982
++#define MSR_ICX_MKTME_STATUS		0x6F
++#define MKTME_ALIASES_FORBIDDEN(x)	(x & BIT(8))
+ 
+-/* Helpers to access TME_ACTIVATE MSR */
+-#define TME_ACTIVATE_LOCKED(x)		(x & 0x1)
+-#define TME_ACTIVATE_ENABLED(x)		(x & 0x2)
++/* Need to check MSR_ICX_MKTME_STATUS for these CPUs */
++// static const struct x86_cpu_id mktme_status_msr_ids[] = {
++	// { X86_VENDOR_INTEL,	6,	INTEL_FAM6_ICELAKE_X		},
++	// { X86_VENDOR_INTEL,	6,	INTEL_FAM6_ICELAKE_D	},
++	// {}
++// };
+ 
+-#define TME_ACTIVATE_POLICY(x)		((x >> 4) & 0xf)	/* Bits 7:4 */
+-#define TME_ACTIVATE_POLICY_AES_XTS_128	0
+-
+-#define TME_ACTIVATE_KEYID_BITS(x)	((x >> 32) & 0xf)	/* Bits 35:32 */
+-
+-#define TME_ACTIVATE_CRYPTO_ALGS(x)	((x >> 48) & 0xffff)	/* Bits 63:48 */
+-#define TME_ACTIVATE_CRYPTO_AES_XTS_128	1
+ 
+ /* Values for mktme_status (SW only construct) */
+ #define MKTME_ENABLED			0
+@@ -514,7 +516,7 @@ static int mktme_status = MKTME_UNINITIALIZED;
+ 
+ static void detect_tme(struct cpuinfo_x86 *c)
+ {
+-	u64 tme_activate, tme_policy, tme_crypto_algs;
++	u64 tme_activate, tme_policy, tme_crypto_algs, tme_bypass;
+ 	int keyid_bits = 0, nr_keyids = 0;
+ 	static u64 tme_activate_cpu0 = 0;
+ 
+@@ -539,17 +541,50 @@ static void detect_tme(struct cpuinfo_x86 *c)
+ 		return;
+ 	}
+ 
++	/* Icelake Server quirk: do not enable MKTME if aliases are forbidden */
++	/*
++	if (x86_match_cpu(mktme_status_msr_ids)) {
++		u64 status;
++		rdmsrl(MSR_ICX_MKTME_STATUS, status);
++
++		if (MKTME_ALIASES_FORBIDDEN(status)) {
++			pr_err_once("x86/tme: Directory Mode is enabled in BIOS\n");
++			pr_err_once("x86/tme: TESTING: ignoring Directory Mode. Not disabling mktme\n");
++			// mktme_status = MKTME_DISABLED;
++		}
++	}
++	*/
++
+ 	if (mktme_status != MKTME_UNINITIALIZED)
+ 		goto detect_keyid_bits;
+ 
+ 	pr_info("x86/tme: enabled by BIOS\n");
++ 
++	tme_bypass = TME_BYPASS_POLICY(tme_activate);
++	if (tme_bypass)
++		pr_info_once("x86/tme: TME is bypassed\n");
+ 
+ 	tme_policy = TME_ACTIVATE_POLICY(tme_activate);
+-	if (tme_policy != TME_ACTIVATE_POLICY_AES_XTS_128)
++	if (tme_policy == TME_ACTIVATE_POLICY_AES_XTS_128)
++		pr_info_once("x86/mktme: active encryption policy: AES_XTS_128\n");
++	else if (tme_policy == TME_ACTIVATE_POLICY_AES_XTS_128_I)
++		pr_info_once("x86/mktme: active encryption policy: AES_XTS_128_I\n");
++	else if (tme_policy == TME_ACTIVATE_POLICY_AES_XTS_256)
++		pr_info_once("x86/mktme: active encryption policy: AES_XTS_256\n");
++	else
+ 		pr_warn("x86/tme: Unknown policy is active: %#llx\n", tme_policy);
+ 
+ 	tme_crypto_algs = TME_ACTIVATE_CRYPTO_ALGS(tme_activate);
+-	if (!(tme_crypto_algs & TME_ACTIVATE_CRYPTO_AES_XTS_128)) {
++	if (tme_crypto_algs & TME_ACTIVATE_CRYPTO_AES_XTS_128) {
++		pr_info_once("x86/mktme: supported encryption algorithm: AES_XTS_128\n");
++	}
++	if (tme_crypto_algs & TME_ACTIVATE_CRYPTO_AES_XTS_128_I) {
++		pr_info_once("x86/mktme: supported encryption algorithm: AES_XTS_128_I\n");
++	}
++	if (tme_crypto_algs & TME_ACTIVATE_CRYPTO_AES_XTS_256) {
++		pr_info_once("x86/mktme: supported encryption algorithm: AES_XTS_256\n");
++	}
++	if (!(tme_crypto_algs & TME_ACTIVATE_CRYPTO_KNOWN_ALGS)) {
+ 		pr_err("x86/mktme: No known encryption algorithm is supported: %#llx\n",
+ 				tme_crypto_algs);
+ 		mktme_status = MKTME_DISABLED;
+@@ -562,12 +597,57 @@ static void detect_tme(struct cpuinfo_x86 *c)
+ 		pr_info_once("x86/mktme: %d KeyIDs available\n", nr_keyids);
+ 	} else {
+ 		pr_info_once("x86/mktme: disabled by BIOS\n");
++		mktme_status = MKTME_DISABLED;
+ 	}
+ 
+ 	if (mktme_status == MKTME_UNINITIALIZED) {
+ 		/* MKTME is usable */
+ 		mktme_status = MKTME_ENABLED;
+ 	}
++ 
++#ifdef CONFIG_X86_INTEL_MKTME
++	if (mktme_status == MKTME_ENABLED && nr_keyids) {
++		__mktme_nr_keyids = nr_keyids;
++		__mktme_keyid_shift = c->x86_phys_bits - keyid_bits;
++
++		/*
++		 * Mask out bits claimed from KeyID from physical address mask.
++		 *
++		 * For instance, if a CPU enumerates 52 physical address bits
++		 * and number of bits claimed for KeyID is 6, bits 51:46 of
++		 * physical address is unusable.
++		 */
++		__mktme_keyid_mask = GENMASK_ULL(c->x86_phys_bits - 1, mktme_keyid_shift());
++		physical_mask &= ~mktme_keyid_mask();
++
++		tme_crypto_algs = TME_ACTIVATE_CRYPTO_ALGS(tme_activate);
++		mktme_algs = tme_crypto_algs & TME_ACTIVATE_CRYPTO_KNOWN_ALGS;
++
++		pr_info_once("x86/mktme: tme_policy          = %#llx\n", tme_policy);
++		pr_info_once("x86/mktme: tme_bypass          = %#llx\n", tme_bypass);
++		pr_info_once("x86/mktme: tme_activate        = %#llx\n", tme_activate);
++		pr_info_once("x86/mktme: tme_crypto_algs     = %#llx\n", tme_crypto_algs);
++		pr_info_once("x86/mktme: mktme_algs          = %#llx\n", mktme_algs);
++		pr_info_once("x86/mktme: __mktme_keyid_shift = %#llx\n", __mktme_keyid_shift);
++		pr_info_once("x86/mktme: __mktme_keyid_mask  = %#llx\n", __mktme_keyid_mask);
++		pr_info_once("x86/mktme: physical_mask       = %#llx\n", physical_mask);
++		if(mktme_algs != tme_crypto_algs){
++			pr_warn_once("x86/mktme: mktme_algs != tme_crypto_algs. CPU may support more algorithms than we know about.\n");
++		}
++	} else {
++		/*
++		 * Reset __PHYSICAL_MASK.
++		 * Maybe needed if there's inconsistent configuation
++		 * between CPUs.
++		 *
++		 * FIXME: broken for hotplug.
++		 * We must not allow onlining secondary CPUs with non-matching
++		 * configuration.
++		 */
++		mktme_disable();
++	}
++#endif
++
+ 
+ 	/*
+ 	 * KeyID bits effectively lower the number of physical address
+@@ -712,9 +792,6 @@ static void init_intel(struct cpuinfo_x86 *c)
+ 
+ 	init_ia32_feat_ctl(c);
+ 
+-	if (cpu_has(c, X86_FEATURE_TME))
+-		detect_tme(c);
+-
+ 	init_intel_misc_features(c);
+ 
+ 	if (tsx_ctrl_state == TSX_CTRL_ENABLE)
+diff --git a/arch/x86/kernel/cpu/mce/apei.c b/arch/x86/kernel/cpu/mce/apei.c
+index 0e3ae64d3b76..38b83293f05c 100644
+--- a/arch/x86/kernel/cpu/mce/apei.c
++++ b/arch/x86/kernel/cpu/mce/apei.c
+@@ -26,6 +26,8 @@
+ 
+ #include "internal.h"
+ 
++extern phys_addr_t mktme_keyid_mask(void);
++
+ void apei_mce_report_mem_error(int severity, struct cper_sec_mem_err *mem_err)
+ {
+ 	struct mce m;
+@@ -47,7 +49,7 @@ void apei_mce_report_mem_error(int severity, struct cper_sec_mem_err *mem_err)
+ 		m.tsc = rdtsc();
+ 	}
+ 
+-	m.addr = mem_err->physical_addr;
++	m.addr = mem_err->physical_addr & ~mktme_keyid_mask();
+ 	mce_log(&m);
+ }
+ EXPORT_SYMBOL_GPL(apei_mce_report_mem_error);
+diff --git a/arch/x86/kernel/cpu/mce/core.c b/arch/x86/kernel/cpu/mce/core.c
+index 193204aee880..8d028462306f 100644
+--- a/arch/x86/kernel/cpu/mce/core.c
++++ b/arch/x86/kernel/cpu/mce/core.c
+@@ -93,7 +93,7 @@ struct mca_config mca_cfg __read_mostly = {
+ 	 * 2: SIGBUS or log uncorrected errors (if possible), log corr. errors
+ 	 * 3: never panic or SIGBUS, log all errors (for testing only)
+ 	 */
+-	.tolerant = 1,
++	.tolerant = 2,
+ 	.monarch_timeout = -1
+ };
+ 
+@@ -225,11 +225,56 @@ struct mca_msr_regs msr_ops = {
+ 
+ static void __print_mce(struct mce *m)
+ {
++	// char * address_mode = "Reserved";
++	// char * mscod = "Unknown";
++
+ 	pr_emerg(HW_ERR "CPU %d: Machine Check%s: %Lx Bank %d: %016Lx\n",
+ 		 m->extcpu,
+ 		 (m->mcgstatus & MCG_STATUS_MCIP ? " Exception" : ""),
+ 		 m->mcgstatus, m->bank, m->status);
+ 
++	// switch ((m->status >>  6) & 0b111){
++	// 	case 0b000: address_mode = "Segment Offset"; break;
++	// 	case 0b001: address_mode = "Linear Address"; break;
++	// 	case 0b010: address_mode = "Physical Address"; break;
++	// 	case 0b011: address_mode = "Memory Address"; break;
++	// 	case 0b111: address_mode = "Generic"; break;
++	// 	default: address_mode = "Reserved"; break;
++	// }
++
++	// switch ((m->status >> 16) & 0xFFFF){
++	// 	case 0x0822: mscod = "Key Parity Error [Fatal]"; break;
++	// 	case 0x0824: mscod = "FIFO Overflow [Fatal]"; break;
++	// 	case 0x0825: mscod = "FIFO Underflow [Fatal]"; break;
++	// 	case 0x0823: mscod = "MISC [Fatal]"; break;
++	// 	case 0x0826: mscod = "SGX-TEM NS Error [UCNA]"; break;
++	// 	case 0x082c: mscod = "SGX-TEM NS Error in 2LM [MCA]"; break;
++	// 	case 0x082a: mscod = "Integrity Error [UCNA]"; break;
++	// 	case 0x082b: mscod = "TD bit mismatch on an access with integrity"; break;
++	// 	case 0x082d: mscod = "Key ID Poison Error [UCNA]"; break;
++	// 	default: mscod = "???"; break;
++	// }
++	// pr_emerg(HW_ERR "IA32_MCi_STATUS  0x%16Lx\n", m->status);
++	// pr_emerg(HW_ERR "IA32_MCi_ADDR    0x%16Lx\n", m->addr);
++	// pr_emerg(HW_ERR "IA32_MCi_MISC    0x%16Lx\n", m->misc);
++	// pr_emerg(HW_ERR "IA32_MCi_MISC[ 5: 0] Recoverable Address LSB                             0x%02Lx\n",      (m->status >>  0) & 0b111111);
++	// pr_emerg(HW_ERR "IA32_MCi_MISC[ 8: 6] Address Mode                                        0x%01Lx (%s)\n", (m->status >>  6) & 0b111, address_mode);
++	// pr_emerg(HW_ERR "IA32_MCi_STATUS[15: 0] MCA Error Code                                    0x%04Lx\n",      (m->status >>  0) & 0xFFFF);
++	// pr_emerg(HW_ERR "IA32_MCi_STATUS[31:16] MSCOD Model Specific Error Code                   0x%04Lx (%s)\n", (m->status >> 16) & 0xFFFF, mscod);
++	// pr_emerg(HW_ERR "IA32_MCi_STATUS[36:32] Other Info                                        0x%04Lx\n",      (m->status >> 32) & 0b11111);
++	// pr_emerg(HW_ERR "IA32_MCi_STATUS[   37] Firmware updated errr status indicator            0x%01Lx\n",      (m->status >> 37) & 0b1);
++	// pr_emerg(HW_ERR "IA32_MCi_STATUS[52:38] Corrected Error Count                             0x%04Lx\n",      (m->status >> 38) & 0x7FFF);
++	// pr_emerg(HW_ERR "IA32_MCi_STATUS[54:53] Threshold-based error status                      0x%01Lx\n",      (m->status >> 53) & 0b11);
++	// pr_emerg(HW_ERR "IA32_MCi_STATUS[   55] AR (Recovery action required for UCR error)       0x%01Lx\n",      (m->status >> 55) & 0b1);
++	// pr_emerg(HW_ERR "IA32_MCi_STATUS[   56] S (Signaling UCR (uncorrected recoverable error)) 0x%01Lx\n",      (m->status >> 56) & 0b1);
++	// pr_emerg(HW_ERR "IA32_MCi_STATUS[   57] PCC (Processor context corrupted)                 0x%01Lx\n",      (m->status >> 57) & 0b1);
++	// pr_emerg(HW_ERR "IA32_MCi_STATUS[   58] ADDRV (MCi_ADDR register valid)                   0x%01Lx\n",      (m->status >> 58) & 0b1);
++	// pr_emerg(HW_ERR "IA32_MCi_STATUS[   59] MISCV (MCi_MISC register valid)                   0x%01Lx\n",      (m->status >> 59) & 0b1);
++	// pr_emerg(HW_ERR "IA32_MCi_STATUS[   60] EN (Error reporting enabled)                      0x%01Lx\n",      (m->status >> 60) & 0b1);
++	// pr_emerg(HW_ERR "IA32_MCi_STATUS[   61] UC (Uncorrected Error)                            0x%01Lx\n",      (m->status >> 61) & 0b1);
++	// pr_emerg(HW_ERR "IA32_MCi_STATUS[   62] OVER (Error Overflow)                             0x%01Lx\n",      (m->status >> 62) & 0b1);
++	// pr_emerg(HW_ERR "IA32_MCi_STATUS[   63] VAL (MCi_STATUS register valid)                   0x%01Lx\n",      (m->status >> 63) & 0b1);
++
+ 	if (m->ip) {
+ 		pr_emerg(HW_ERR "RIP%s %02x:<%016Lx> ",
+ 			!(m->mcgstatus & MCG_STATUS_EIPV) ? " !INEXACT!" : "",
+@@ -617,6 +662,8 @@ static int mce_early_notifier(struct notifier_block *nb, unsigned long val,
+ 	if (!m)
+ 		return NOTIFY_DONE;
+ 
++	m->addr = m->addr & ~mktme_keyid_mask(); //TODO
++
+ 	/* Emit the trace record: */
+ 	trace_mce_record(m);
+ 
+@@ -638,6 +685,9 @@ static int uc_decode_notifier(struct notifier_block *nb, unsigned long val,
+ 	struct mce *mce = (struct mce *)data;
+ 	unsigned long pfn;
+ 
++	if (mce)
++		mce->addr = mce->addr & ~mktme_keyid_mask(); //TODO
++
+ 	if (!mce || !mce_usable_address(mce))
+ 		return NOTIFY_DONE;
+ 
+@@ -667,6 +717,8 @@ static int mce_default_notifier(struct notifier_block *nb, unsigned long val,
+ 	if (!m)
+ 		return NOTIFY_DONE;
+ 
++	m->addr = m->addr & ~mktme_keyid_mask(); //TODO
++
+ 	if (mca_cfg.print_all || !m->kflags)
+ 		__print_mce(m);
+ 
+@@ -1266,14 +1318,21 @@ static void kill_me_maybe(struct callback_head *cb)
+ 	int ret;
+ 
+ 	p->mce_count = 0;
+-	pr_err("Uncorrected hardware memory error in user-access at %llx", p->mce_addr);
++	pr_err("kill_me_maybe: Uncorrected hardware memory error in user-access at %llx", p->mce_addr);
++	p->mce_addr = p->mce_addr & ~mktme_keyid_mask(); //TODO
++	// pr_err("Uncorrected hardware memory error in user-access at %llx (after masking away keyID)", p->mce_addr);
+ 
++	pr_err("kill_me_maybe: p->mce_ripv is %d\n", p->mce_ripv);
+ 	if (!p->mce_ripv)
+ 		flags |= MF_MUST_KILL;
+ 
++	pr_err("kill_me_maybe: before memory_failure\n");
+ 	ret = memory_failure(p->mce_addr >> PAGE_SHIFT, flags);
++	pr_err("kill_me_maybe: memory_failure returned %d\n", ret);
+ 	if (!ret && !(p->mce_kflags & MCE_IN_KERNEL_COPYIN)) {
++		pr_err("kill_me_maybe: set_mce_nospec\n");
+ 		set_mce_nospec(p->mce_addr >> PAGE_SHIFT, p->mce_whole_page);
++		pr_err("kill_me_maybe: sync_core\n");
+ 		sync_core();
+ 		return;
+ 	}
+@@ -1287,9 +1346,11 @@ static void kill_me_maybe(struct callback_head *cb)
+ 		return;
+ 
+ 	if (p->mce_vaddr != (void __user *)-1l) {
++		pr_err("kill_me_maybe: force_sig_mceerr\n");
+ 		force_sig_mceerr(BUS_MCEERR_AR, p->mce_vaddr, PAGE_SHIFT);
+ 	} else {
+ 		pr_err("Memory error not recovered");
++		pr_err("kill_me_maybe: kill_me_now\n");
+ 		kill_me_now(cb);
+ 	}
+ }
+@@ -1300,7 +1361,8 @@ static void queue_task_work(struct mce *m, char *msg, int kill_current_task)
+ 
+ 	/* First call, save all the details */
+ 	if (count == 1) {
+-		current->mce_addr = m->addr;
++		// current->mce_addr = m->addr;
++		current->mce_addr = m->addr & ~mktme_keyid_mask();
+ 		current->mce_kflags = m->kflags;
+ 		current->mce_ripv = !!(m->mcgstatus & MCG_STATUS_RIPV);
+ 		current->mce_whole_page = whole_page(m);
+diff --git a/arch/x86/kernel/cpu/mce/severity.c b/arch/x86/kernel/cpu/mce/severity.c
+index 17e631443116..2c55a28b4718 100644
+--- a/arch/x86/kernel/cpu/mce/severity.c
++++ b/arch/x86/kernel/cpu/mce/severity.c
+@@ -78,8 +78,9 @@ static struct severity {
+ 		EXCP, BITCLR(MCI_STATUS_EN)
+ 		),
+ 	MCESEV(
+-		PANIC, "Processor context corrupt",
+-		BITSET(MCI_STATUS_PCC)
++		/*PANIC, "Processor context corrupt", BITSET(MCI_STATUS_PCC) // original */
++		/*UCNA, "Processor context corrupt", BITSET(MCI_STATUS_PCC) // locks up CPU*/
++		AR, "Processor context corrupt", SER, BITSET(MCI_STATUS_PCC)
+ 		),
+ 	/* When MCIP is not set something is very confused */
+ 	MCESEV(
+diff --git a/arch/x86/kernel/cpu/mtrr/mtrr.c b/arch/x86/kernel/cpu/mtrr/mtrr.c
+index 2746cac9d8a9..cfa0a62cc102 100644
+--- a/arch/x86/kernel/cpu/mtrr/mtrr.c
++++ b/arch/x86/kernel/cpu/mtrr/mtrr.c
+@@ -712,6 +712,16 @@ void __init mtrr_bp_init(void)
+ 			    (boot_cpu_data.x86_stepping == 0x3 ||
+ 			     boot_cpu_data.x86_stepping == 0x4))
+ 				phys_addr = 36;
++ 
++			if (boot_cpu_has(X86_FEATURE_TME)) {
++				u64 tme_activate;
++
++				rdmsrl(MSR_IA32_TME_ACTIVATE, tme_activate);
++				if (TME_ACTIVATE_LOCKED(tme_activate) &&
++				    TME_ACTIVATE_ENABLED(tme_activate)) {
++					phys_addr -= TME_ACTIVATE_KEYID_BITS(tme_activate);
++				}
++			}
+ 
+ 			size_or_mask = SIZE_OR_MASK_BITS(phys_addr);
+ 			size_and_mask = ~size_or_mask & 0xfffff00000ULL;
+diff --git a/arch/x86/kernel/e820.c b/arch/x86/kernel/e820.c
+index bc0657f0deed..60f39c94eac0 100644
+--- a/arch/x86/kernel/e820.c
++++ b/arch/x86/kernel/e820.c
+@@ -838,6 +838,9 @@ static unsigned long __init e820_end_pfn(unsigned long limit_pfn, enum e820_type
+ 		unsigned long start_pfn;
+ 		unsigned long end_pfn;
+ 
++		// pr_info("e820_entry type %#lx addr %#lx size %#lx\n",
++			// entry->type, entry->addr, entry->size);
++
+ 		if (entry->type != type)
+ 			continue;
+ 
+@@ -865,6 +868,8 @@ static unsigned long __init e820_end_pfn(unsigned long limit_pfn, enum e820_type
+ unsigned long __init e820__end_of_ram_pfn(void)
+ {
+ 	return e820_end_pfn(MAX_ARCH_PFN, E820_TYPE_RAM);
++	// return e820_end_pfn(0x10000000, E820_TYPE_RAM); // 1 TB
++	// return e820_end_pfn(0x4000000, E820_TYPE_RAM);     // 256 GB
+ }
+ 
+ unsigned long __init e820__end_of_low_ram_pfn(void)
+diff --git a/arch/x86/kernel/head64.c b/arch/x86/kernel/head64.c
+index de01903c3735..3aad263f1001 100644
+--- a/arch/x86/kernel/head64.c
++++ b/arch/x86/kernel/head64.c
+@@ -64,6 +64,10 @@ EXPORT_SYMBOL(vmalloc_base);
+ unsigned long vmemmap_base __ro_after_init = __VMEMMAP_BASE_L4;
+ EXPORT_SYMBOL(vmemmap_base);
+ #endif
++unsigned long direct_mapping_size __ro_after_init = -1UL;
++EXPORT_SYMBOL(direct_mapping_size);
++unsigned long direct_mapping_mask __ro_after_init = -1UL;
++EXPORT_SYMBOL(direct_mapping_mask);
+ 
+ /*
+  * GDT used on the boot CPU before switching to virtual addresses.
+diff --git a/arch/x86/kernel/setup.c b/arch/x86/kernel/setup.c
+index 40ed44ead063..16704dd72971 100644
+--- a/arch/x86/kernel/setup.c
++++ b/arch/x86/kernel/setup.c
+@@ -979,6 +979,9 @@ void __init setup_arch(char **cmdline_p)
+ 	 * effect.
+ 	 */
+ 	init_cache_modes();
++ 
++	 /* direct_mapping_size has to be initialized before KASLR and MKTME */
++	calculate_direct_mapping_size();
+ 
+ 	/*
+ 	 * Define random base addresses for memory sections after max_pfn is
+diff --git a/arch/x86/kvm/mmu/spte.c b/arch/x86/kvm/mmu/spte.c
+index 3e97cdb13eb7..7562ad5f533b 100644
+--- a/arch/x86/kvm/mmu/spte.c
++++ b/arch/x86/kvm/mmu/spte.c
+@@ -88,6 +88,22 @@ static bool kvm_is_mmio_pfn(kvm_pfn_t pfn)
+ 				     pfn_to_hpa(pfn + 1) - 1,
+ 				     E820_TYPE_RAM);
+ }
++ 
++static u64 get_phys_encryption_mask(kvm_pfn_t pfn)
++{
++	struct page *page;
++
++	if (!mktme_enabled())
++		return shadow_me_mask;
++
++	if (!pfn_valid(pfn))
++		return 0;
++
++	page = pfn_to_page(pfn);
++
++	return ((u64)page_keyid(page)) << mktme_keyid_shift();
++}
++
+ 
+ int make_spte(struct kvm_vcpu *vcpu, unsigned int pte_access, int level,
+ 		     gfn_t gfn, kvm_pfn_t pfn, u64 old_spte, bool speculative,
+@@ -137,7 +153,7 @@ int make_spte(struct kvm_vcpu *vcpu, unsigned int pte_access, int level,
+ 		pte_access &= ~ACC_WRITE_MASK;
+ 
+ 	if (!kvm_is_mmio_pfn(pfn))
+-		spte |= shadow_me_mask;
++		spte |= get_phys_encryption_mask(pfn);
+ 
+ 	spte |= (u64)pfn << PAGE_SHIFT;
+ 
+diff --git a/arch/x86/lib/copy_page_64.S b/arch/x86/lib/copy_page_64.S
+index db4b4f9197c7..3f9c7d5ebf51 100644
+--- a/arch/x86/lib/copy_page_64.S
++++ b/arch/x86/lib/copy_page_64.S
+@@ -13,13 +13,13 @@
+  * prefetch distance based on SMP/UP.
+  */
+ 	ALIGN
+-SYM_FUNC_START(copy_page)
++SYM_FUNC_START(copy_page_orig)
+ 	ALTERNATIVE "jmp copy_page_regs", "", X86_FEATURE_REP_GOOD
+ 	movl	$4096/8, %ecx
+ 	rep	movsq
+ 	ret
+-SYM_FUNC_END(copy_page)
+-EXPORT_SYMBOL(copy_page)
++SYM_FUNC_END(copy_page_orig)
++EXPORT_SYMBOL(copy_page_orig)
+ 
+ SYM_FUNC_START_LOCAL(copy_page_regs)
+ 	subq	$2*8,	%rsp
+diff --git a/arch/x86/lib/mmx_32.c b/arch/x86/lib/mmx_32.c
+index cc5f4ea943d3..d0e0e9343c82 100644
+--- a/arch/x86/lib/mmx_32.c
++++ b/arch/x86/lib/mmx_32.c
+@@ -26,6 +26,15 @@
+ #include <asm/fpu/api.h>
+ #include <asm/asm.h>
+ 
++
++#ifdef CONFIG_X86_INTEL_MKTME
++XXX if this line leads to a compile error, implement the following functions with movdir64b
++XXX fast_clear_page/slow_clear_page
++XXX fast_copy_page/slow_copy_page
++XXX fast_zero_page/slow_zero_page
++XXX mmx_copy_page/mmx_clear_page
++#endif
++
+ /*
+  * Use KFPU_387.  MMX instructions are not affected by MXCSR,
+  * but both AMD and Intel documentation states that even integer MMX
+diff --git a/arch/x86/mm/Makefile b/arch/x86/mm/Makefile
+index 5864219221ca..b6782cb6f080 100644
+--- a/arch/x86/mm/Makefile
++++ b/arch/x86/mm/Makefile
+@@ -55,3 +55,6 @@ obj-$(CONFIG_PAGE_TABLE_ISOLATION)		+= pti.o
+ obj-$(CONFIG_AMD_MEM_ENCRYPT)	+= mem_encrypt.o
+ obj-$(CONFIG_AMD_MEM_ENCRYPT)	+= mem_encrypt_identity.o
+ obj-$(CONFIG_AMD_MEM_ENCRYPT)	+= mem_encrypt_boot.o
++
++obj-$(CONFIG_X86_INTEL_MKTME)	+= mktme.o
++obj-$(CONFIG_X86_MEM_ENCRYPT_COMMON)	+= mem_encrypt_common.o
+diff --git a/arch/x86/mm/init_64.c b/arch/x86/mm/init_64.c
+index 36098226a957..5ebe13ed22de 100644
+--- a/arch/x86/mm/init_64.c
++++ b/arch/x86/mm/init_64.c
+@@ -730,6 +730,7 @@ __kernel_physical_mapping_init(unsigned long paddr_start,
+ {
+ 	bool pgd_changed = false;
+ 	unsigned long vaddr, vaddr_start, vaddr_end, vaddr_next, paddr_last;
++	int ret;
+ 
+ 	paddr_last = paddr_end;
+ 	vaddr = (unsigned long)__va(paddr_start);
+@@ -765,6 +766,9 @@ __kernel_physical_mapping_init(unsigned long paddr_start,
+ 		spin_unlock(&init_mm.page_table_lock);
+ 		pgd_changed = true;
+ 	}
++ 
++	ret = sync_direct_mapping(vaddr_start, vaddr_end);
++	WARN_ON(ret);
+ 
+ 	if (pgd_changed)
+ 		sync_global_pgds(vaddr_start, vaddr_end - 1);
+@@ -1249,10 +1253,13 @@ void __ref vmemmap_free(unsigned long start, unsigned long end,
+ static void __meminit
+ kernel_physical_mapping_remove(unsigned long start, unsigned long end)
+ {
++	int ret;
+ 	start = (unsigned long)__va(start);
+ 	end = (unsigned long)__va(end);
+ 
+ 	remove_pagetable(start, end, true, NULL);
++	ret = sync_direct_mapping(start, end);
++	WARN_ON(ret);
+ }
+ 
+ void __ref arch_remove_memory(u64 start, u64 size, struct vmem_altmap *altmap)
+@@ -1523,6 +1530,70 @@ unsigned long memory_block_size_bytes(void)
+ 
+ 	return memory_block_size_probed;
+ }
++ 
++#ifdef CONFIG_MEMORY_PHYSICAL_PADDING
++void __init calculate_direct_mapping_size(void)
++{
++	unsigned long available_va;
++
++	/* 1/4 of virtual address space is didicated for direct mapping */
++	available_va = 1UL << (__VIRTUAL_MASK_SHIFT - 1);
++
++	/* How much memory the system has? */
++	direct_mapping_size = max_pfn << PAGE_SHIFT;
++	direct_mapping_size = round_up(direct_mapping_size, 1UL << 40);
++
++	if (!mktme_nr_keyids())
++		goto out;
++
++	/*
++	 * For MKTME we need direct_mapping_size to be power-of-2.
++	 * It makes __pa() implementation efficient.
++	 */
++	direct_mapping_size = roundup_pow_of_two(direct_mapping_size);
++
++	/*
++	 * Not enough virtual address space to address all physical memory with
++	 * MKTME enabled. Even without padding.
++	 *
++	 * Disable MKTME instead.
++	 */
++	// pr_info_once("x86/mktme: direct_mapping_size        = %#llx\n", direct_mapping_size);
++	// pr_info_once("x86/mktme: __VIRTUAL_MASK_SHIFT       = %#llx\n", __VIRTUAL_MASK_SHIFT);
++	// pr_info_once("x86/mktme: pgtable_l5_enabled()       = %#llx\n", pgtable_l5_enabled());
++	// pr_info_once("x86/mktme: available_va               = %#llx\n", available_va);
++	// pr_info_once("x86/mktme: available_va/(nr_keyids+1) = %#llx\n", available_va / (mktme_nr_keyids() + 1));
++	if (direct_mapping_size > available_va / (mktme_nr_keyids() + 1)) {
++		pr_err("x86/mktme: Disabled. Not enough virtual address space\n");
++		pr_err("x86/mktme: Consider switching to 5-level paging\n");
++		mktme_disable();
++		goto out;
++	}
++
++	/*
++	 * Virtual address space is divided between per-KeyID direct mappings.
++	 */
++	available_va /= mktme_nr_keyids() + 1;
++out:
++	/* Add padding, if there's enough virtual address space */
++	direct_mapping_size += (1UL << 40) * CONFIG_MEMORY_PHYSICAL_PADDING;
++	if (mktme_nr_keyids())
++		direct_mapping_size = roundup_pow_of_two(direct_mapping_size);
++
++	if (direct_mapping_size > available_va)
++		direct_mapping_size = available_va;
++
++	/*
++	 * For MKTME, make sure direct_mapping_size is still power-of-2
++	 * after adding padding and calculate mask that is used in __pa().
++	 */
++	if (mktme_nr_keyids()) {
++		direct_mapping_size = rounddown_pow_of_two(direct_mapping_size);
++		direct_mapping_mask = direct_mapping_size - 1;
++	}
++}
++#endif
++
+ 
+ #ifdef CONFIG_SPARSEMEM_VMEMMAP
+ /*
+diff --git a/arch/x86/mm/kaslr.c b/arch/x86/mm/kaslr.c
+index 557f0fe25dff..85db4b862c06 100644
+--- a/arch/x86/mm/kaslr.c
++++ b/arch/x86/mm/kaslr.c
+@@ -94,7 +94,14 @@ void __init kernel_randomize_memory(void)
+ 	 */
+ 	BUG_ON(kaslr_regions[0].base != &page_offset_base);
+ 	memory_tb = DIV_ROUND_UP(max_pfn << PAGE_SHIFT, 1UL << TB_SHIFT) +
+-		CONFIG_RANDOMIZE_MEMORY_PHYSICAL_PADDING;
++		CONFIG_MEMORY_PHYSICAL_PADDING;
++
++	/*
++	 * Calculate space required to map all physical memory.
++	 * In case of MKTME, we map physical memory multiple times, one for
++	 * each KeyID. If MKTME is disabled mktme_nr_keyids() is 0.
++	 */
++	memory_tb = (direct_mapping_size * (mktme_nr_keyids() + 1)) >> TB_SHIFT;
+ 
+ 	/* Adapt physical memory region size based on available memory */
+ 	if (memory_tb < kaslr_regions[0].size_tb)
+diff --git a/arch/x86/mm/mem_encrypt.c b/arch/x86/mm/mem_encrypt.c
+index ff08dc463634..328a9521387b 100644
+--- a/arch/x86/mm/mem_encrypt.c
++++ b/arch/x86/mm/mem_encrypt.c
+@@ -15,10 +15,10 @@
+ #include <linux/dma-direct.h>
+ #include <linux/swiotlb.h>
+ #include <linux/mem_encrypt.h>
+-#include <linux/device.h>
+-#include <linux/kernel.h>
+-#include <linux/bitops.h>
+-#include <linux/dma-mapping.h>
++// #include <linux/device.h>
++// #include <linux/kernel.h>
++// #include <linux/bitops.h>
++// #include <linux/dma-mapping.h>
+ #include <linux/virtio_config.h>
+ 
+ #include <asm/tlbflush.h>
+@@ -389,32 +389,6 @@ bool noinstr sev_es_active(void)
+ 	return sev_status & MSR_AMD64_SEV_ES_ENABLED;
+ }
+ 
+-/* Override for DMA direct allocation check - ARCH_HAS_FORCE_DMA_UNENCRYPTED */
+-bool force_dma_unencrypted(struct device *dev)
+-{
+-	/*
+-	 * For SEV, all DMA must be to unencrypted addresses.
+-	 */
+-	if (sev_active())
+-		return true;
+-
+-	/*
+-	 * For SME, all DMA must be to unencrypted addresses if the
+-	 * device does not support DMA to addresses that include the
+-	 * encryption mask.
+-	 */
+-	if (sme_active()) {
+-		u64 dma_enc_mask = DMA_BIT_MASK(__ffs64(sme_me_mask));
+-		u64 dma_dev_mask = min_not_zero(dev->coherent_dma_mask,
+-						dev->bus_dma_limit);
+-
+-		if (dma_dev_mask <= dma_enc_mask)
+-			return true;
+-	}
+-
+-	return false;
+-}
+-
+ void __init mem_encrypt_free_decrypted_mem(void)
+ {
+ 	unsigned long vaddr, vaddr_end, npages;
+diff --git a/arch/x86/mm/mem_encrypt_common.c b/arch/x86/mm/mem_encrypt_common.c
+new file mode 100644
+index 000000000000..3efab910cff8
+--- /dev/null
++++ b/arch/x86/mm/mem_encrypt_common.c
+@@ -0,0 +1,52 @@
++#include <linux/mm.h>
++#include <linux/dma-mapping.h>
++#include <asm/mem_encrypt.h>
++#include <asm/mktme.h>
++
++/*
++ * Encryption bits need to be set and cleared for both Intel MKTME and
++ * AMD SME when converting between DMA address and physical address.
++ */
++dma_addr_t __mem_encrypt_dma_set(dma_addr_t daddr, phys_addr_t paddr)
++{
++	unsigned long keyid;
++
++	if (sme_active())
++		return __sme_set(daddr);
++	keyid = page_keyid(pfn_to_page(__phys_to_pfn(paddr)));
++
++	return (daddr & ~mktme_keyid_mask()) | (keyid << mktme_keyid_shift());
++}
++
++phys_addr_t __mem_encrypt_dma_clear(phys_addr_t paddr)
++{
++	if (sme_active())
++		return __sme_clr(paddr);
++
++	return paddr & ~mktme_keyid_mask();
++}
++
++/* Override for DMA direct allocation check - ARCH_HAS_FORCE_DMA_UNENCRYPTED */
++bool force_dma_unencrypted(struct device *dev)
++{
++	u64 dma_enc_mask, dma_dev_mask;
++
++	/*
++	 * For SEV, all DMA must be to unencrypted addresses.
++	 */
++	if (sev_active())
++		return true;
++
++	/*
++	 * For SME and MKTME, all DMA must be to unencrypted addresses if the
++	 * device does not support DMA to addresses that include the encryption
++	 * mask.
++	 */
++	if (!sme_active() && !mktme_enabled())
++		return false;
++
++	dma_enc_mask = sme_me_mask | mktme_keyid_mask();
++	dma_dev_mask = min_not_zero(dev->coherent_dma_mask, dev->bus_dma_limit);
++
++	return (dma_dev_mask & dma_enc_mask) != dma_enc_mask;
++}
+diff --git a/arch/x86/mm/mktme.c b/arch/x86/mm/mktme.c
+new file mode 100644
+index 000000000000..2d46f12e2843
+--- /dev/null
++++ b/arch/x86/mm/mktme.c
+@@ -0,0 +1,708 @@
++#include <linux/mm.h>
++#include <linux/highmem.h>
++#include <linux/rmap.h>
++#include <linux/efi.h>
++#include <asm/mktme.h>
++#include <asm/pgalloc.h>
++#include <asm/tlbflush.h>
++#include <asm/e820/api.h>
++#include <linux/mman.h>
++
++/* Mask to extract KeyID from physical address. */
++phys_addr_t __mktme_keyid_mask;
++phys_addr_t mktme_keyid_mask(void)
++{
++	return __mktme_keyid_mask;
++}
++EXPORT_SYMBOL_GPL(mktme_keyid_mask);
++
++/* Shift of KeyID within physical address. */
++int __mktme_keyid_shift;
++int mktme_keyid_shift(void)
++{
++	return __mktme_keyid_shift;
++}
++EXPORT_SYMBOL_GPL(mktme_keyid_shift);
++
++/*
++ * Number of KeyIDs available for MKTME.
++ * Excludes KeyID-0 which used by TME. MKTME KeyIDs start from 1.
++ */
++int __mktme_nr_keyids;
++int mktme_nr_keyids(void)
++{
++	return __mktme_nr_keyids;
++}
++
++unsigned int mktme_algs;
++
++DEFINE_STATIC_KEY_FALSE(mktme_enabled_key);
++EXPORT_SYMBOL_GPL(mktme_enabled_key);
++
++void mktme_disable(void)
++{
++	physical_mask = (1ULL << __PHYSICAL_MASK_SHIFT) - 1;
++	__mktme_keyid_mask = 0;
++	__mktme_keyid_shift = 0;
++	__mktme_nr_keyids = 0;
++	if (mktme_enabled())
++		static_branch_disable(&mktme_enabled_key);
++}
++
++static bool need_page_mktme(void)
++{
++	int nid;
++
++	/* Make sure keyid doesn't collide with extended page flags */
++	BUILD_BUG_ON(__NR_PAGE_EXT_FLAGS > 16);
++
++	if (!mktme_nr_keyids())
++		return 0;
++
++	for_each_node_state(nid, N_MEMORY) {
++		const efi_memory_desc_t *md;
++		unsigned long node_start, node_end;
++
++		node_start = node_start_pfn(nid) << PAGE_SHIFT;
++		node_end = node_end_pfn(nid) << PAGE_SHIFT;
++
++		for_each_efi_memory_desc(md) {
++			u64 efi_start = md->phys_addr;
++			u64 efi_end = md->phys_addr + PAGE_SIZE * md->num_pages;
++
++			if (md->attribute & EFI_MEMORY_CPU_CRYPTO)
++				continue;
++			if (efi_start > node_end)
++				continue;
++			if (efi_end  < node_start)
++				continue;
++			if (!e820__mapped_any(efi_start, efi_end, E820_TYPE_RAM))
++				continue;
++
++			printk("Memory range %#llx-%#llx: doesn't support encryption\n",
++					efi_start, efi_end);
++			printk("Disable MKTME\n");
++			mktme_disable();
++			break;
++		}
++	}
++
++	return !!mktme_nr_keyids();
++}
++
++static void init_page_mktme(void)
++{
++	static_branch_enable(&mktme_enabled_key);
++
++	sync_direct_mapping(PAGE_OFFSET, PAGE_OFFSET + direct_mapping_size);
++}
++
++struct page_ext_operations page_mktme_ops = {
++	.need = need_page_mktme,
++	.init = init_page_mktme,
++};
++
++int __vma_keyid(struct vm_area_struct *vma)
++{
++	pgprotval_t prot = pgprot_val(vma->vm_page_prot);
++	return (prot & mktme_keyid_mask()) >> mktme_keyid_shift();
++}
++
++/* Set the encryption keyid bits in a VMA */
++void mprotect_set_encrypt(struct vm_area_struct *vma, int newkeyid,
++			  unsigned long start, unsigned long end, unsigned long mprotect_fixup_flags)
++{
++	int oldkeyid = vma_keyid(vma);
++	int is_anon = vma_is_anonymous(vma);
++	pgprotval_t newprot;
++
++	/* Unmap pages with old KeyID if there's any. */
++	if(! (mprotect_fixup_flags & PROT_TODO)){
++		if(is_anon){
++			// pr_info("zap_page_range(vma = %#llx,start = %#llx,size = %#llx)", vma->vm_start, start, end - start);
++			zap_page_range(vma, start, end - start);
++		}else{
++			// pr_info("not_quite_zap_page_range(vma = %#llx,start = %#llx,size = %#llx)", vma->vm_start, start, end - start);
++			not_quite_zap_page_range(vma, start, end - start);
++		}
++	}
++
++	if (oldkeyid == newkeyid)
++		return;
++	vma_put_encrypt_ref(vma);
++	newprot = pgprot_val(vma->vm_page_prot);
++	newprot &= ~mktme_keyid_mask();
++	newprot |= (unsigned long)newkeyid << mktme_keyid_shift();
++	vma->vm_page_prot = __pgprot(newprot);
++	vma_get_encrypt_ref(vma);
++
++	/*
++	 * The VMA doesn't have any inherited pages.
++	 * Start anon VMA tree from scratch.
++	 */
++	if(! (mprotect_fixup_flags & PROT_TODO)){
++		if(is_anon){
++			// pr_info("unlink_anon_vmas(vma = %#llx -- %#llx)", vma->vm_start, vma->vm_end);
++			unlink_anon_vmas(vma);
++		}
++	}
++}
++
++void vma_get_encrypt_ref(struct vm_area_struct *vma)
++{
++	if (vma_keyid(vma))
++		percpu_ref_get(&encrypt_count[vma_keyid(vma)]);
++}
++
++void vma_put_encrypt_ref(struct vm_area_struct *vma)
++{
++	if (vma_keyid(vma))
++		percpu_ref_put(&encrypt_count[vma_keyid(vma)]);
++}
++
++/* Prepare page to be used for encryption. Called from page allocator. */
++void __prep_encrypted_page(struct page *page, int order, int keyid, bool zero)
++{
++	int i;
++
++	/*
++	 * The hardware/CPU does not enforce coherency between mappings
++	 * of the same physical page with different KeyIDs or
++	 * encryption keys. We are responsible for cache management.
++	 *
++	 * Flush cache lines with KeyID-0. page_address() returns virtual
++	 * address of the page mapping with the current (zero) KeyID.
++	 */
++	clflush_cache_range(page_address(page), PAGE_SIZE * (1UL << order));
++
++	for (i = 0; i < (1 << order); i++) {
++		/* All pages coming out of the allocator should have KeyID 0 */
++		WARN_ON_ONCE(lookup_page_ext(page)->keyid);
++
++		/*
++		 * Change KeyID. From now on page_address() will return address
++		 * of the page mapping with the new KeyID.
++		 *
++		 * We don't need barrier() before the KeyID change because
++		 * clflush_cache_range() above stops compiler from reordring
++		 * past the point with mb().
++		 *
++		 * And we don't need a barrier() after the assignment because
++		 * any future reference of KeyID (i.e. from page_address())
++		 * will create address dependency and compiler is not allow to
++		 * mess with this.
++		 */
++		lookup_page_ext(page)->keyid = keyid;
++
++		/* Clear the page after the KeyID is set. */
++		if (zero){
++			clear_highpage(page);
++		}
++		clflush_cache_range(page_address(page), PAGE_SIZE * (1UL << order));
++
++		page++;
++	}
++
++	/*
++	 * Make sure the KeyID cannot be freed until the last page that
++	 * uses the KeyID is gone.
++	 *
++	 * This is required because the page may live longer than VMA it
++	 * is mapped into (i.e. in get_user_pages() case) and having
++	 * refcounting per-VMA is not enough.
++	 *
++	 * Taking a reference per-4K helps in case if the page will be
++	 * split after the allocation. free_encrypted_page() will balance
++	 * out the refcount even if the page was split and freed as bunch
++	 * of 4K pages.
++	 */
++
++	percpu_ref_get_many(&encrypt_count[keyid], 1 << order);
++}
++
++/*
++ * Handles freeing of encrypted page.
++ * Called from page allocator on freeing encrypted page.
++ */
++void free_encrypted_page(struct page *page, int order)
++{
++	int i, keyid;
++
++	keyid = page_keyid(page);
++
++	/*
++	 * The hardware/CPU does not enforce coherency between mappings
++	 * of the same physical page with different KeyIDs or
++	 * encryption keys. We are responsible for cache management.
++	 *
++	 * Flush cache lines with non-0 KeyID. page_address() returns virtual
++	 * address of the page mapping with the current (non-zero) KeyID.
++	 */
++	clflush_cache_range(page_address(page), PAGE_SIZE * (1UL << order));
++
++	for (i = 0; i < (1 << order); i++) {
++		/* Check if the page has reasonable KeyID */
++		WARN_ON_ONCE(!lookup_page_ext(page)->keyid);
++		WARN_ON_ONCE(lookup_page_ext(page)->keyid > mktme_nr_keyids());
++
++		/*
++		 * Switch the page back to zero KeyID.
++		 *
++		 * We don't need barrier() before the KeyID change because
++		 * clflush_cache_range() above stops compiler from reordring
++		 * past the point with mb().
++		 *
++		 * And we don't need a barrier() after the assignment because
++		 * any future reference of KeyID (i.e. from page_address())
++		 * will create address dependency and compiler is not allow to
++		 * mess with this.
++		 */
++		lookup_page_ext(page)->keyid = 0;
++
++		/*
++		* We (may) need to re-initialize the page using keyID0
++		* so that it can be used by anyone without triggering exceptions
++		*/
++		// clear_page(page); //TODO assert that this is using keyid0
++		clear_highpage(page);
++
++		page++;
++	}
++
++	percpu_ref_put_many(&encrypt_count[keyid], 1 << order);
++}
++
++static int sync_direct_mapping_pte(unsigned long keyid,
++		pmd_t *dst_pmd, pmd_t *src_pmd,
++		unsigned long addr, unsigned long end)
++{
++	pte_t *src_pte, *dst_pte;
++	pte_t *new_pte = NULL;
++	bool remove_pte;
++
++	/*
++	 * We want to unmap and free the page table if the source is empty and
++	 * the range covers whole page table.
++	 */
++	remove_pte = !src_pmd && PAGE_ALIGNED(addr) && PAGE_ALIGNED(end);
++
++	/*
++	 * PMD page got split into page table.
++	 * Clear PMD mapping. Page table will be established instead.
++	 */
++	if (pmd_large(*dst_pmd)) {
++		spin_lock(&init_mm.page_table_lock);
++		pmd_clear(dst_pmd);
++		spin_unlock(&init_mm.page_table_lock);
++	}
++
++	/* Allocate a new page table if needed. */
++	if (pmd_none(*dst_pmd)) {
++		new_pte = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
++		if (!new_pte)
++			return -ENOMEM;
++		dst_pte = new_pte + pte_index(addr + keyid * direct_mapping_size);
++	} else {
++		dst_pte = pte_offset_map(dst_pmd, addr + keyid * direct_mapping_size);
++	}
++	src_pte = src_pmd ? pte_offset_map(src_pmd, addr) : NULL;
++
++	spin_lock(&init_mm.page_table_lock);
++
++	do {
++		pteval_t val;
++
++		if (!src_pte || pte_none(*src_pte)) {
++			set_pte(dst_pte, __pte(0));
++			goto next;
++		}
++
++		if (!pte_none(*dst_pte)) {
++			/*
++			 * Sanity check: PFNs must match between source
++			 * and destination even if the rest doesn't.
++			 */
++			BUG_ON(pte_pfn(*dst_pte) != pte_pfn(*src_pte));
++		}
++
++		/* Copy entry, but set KeyID. */
++		val = pte_val(*src_pte) | keyid << mktme_keyid_shift();
++		val &= __supported_pte_mask;
++		set_pte(dst_pte, __pte(val));
++next:
++		addr += PAGE_SIZE;
++		dst_pte++;
++		if (src_pte)
++			src_pte++;
++	} while (addr != end);
++
++	if (new_pte)
++		pmd_populate_kernel(&init_mm, dst_pmd, new_pte);
++
++	if (remove_pte) {
++		__free_page(pmd_page(*dst_pmd));
++		pmd_clear(dst_pmd);
++	}
++
++	spin_unlock(&init_mm.page_table_lock);
++
++	return 0;
++}
++
++static int sync_direct_mapping_pmd(unsigned long keyid,
++		pud_t *dst_pud, pud_t *src_pud,
++		unsigned long addr, unsigned long end)
++{
++	pmd_t *src_pmd, *dst_pmd;
++	pmd_t *new_pmd = NULL;
++	bool remove_pmd = false;
++	unsigned long next;
++	int ret = 0;
++
++	/*
++	 * We want to unmap and free the page table if the source is empty and
++	 * the range covers whole page table.
++	 */
++	remove_pmd = !src_pud && IS_ALIGNED(addr, PUD_SIZE) && IS_ALIGNED(end, PUD_SIZE);
++
++	/*
++	 * PUD page got split into page table.
++	 * Clear PUD mapping. Page table will be established instead.
++	 */
++	if (pud_large(*dst_pud)) {
++		spin_lock(&init_mm.page_table_lock);
++		pud_clear(dst_pud);
++		spin_unlock(&init_mm.page_table_lock);
++	}
++
++	/* Allocate a new page table if needed. */
++	if (pud_none(*dst_pud)) {
++		new_pmd = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
++		if (!new_pmd)
++			return -ENOMEM;
++		dst_pmd = new_pmd + pmd_index(addr + keyid * direct_mapping_size);
++	} else {
++		dst_pmd = pmd_offset(dst_pud, addr + keyid * direct_mapping_size);
++	}
++	src_pmd = src_pud ? pmd_offset(src_pud, addr) : NULL;
++
++	do {
++		pmd_t *__src_pmd = src_pmd;
++
++		next = pmd_addr_end(addr, end);
++		if (!__src_pmd || pmd_none(*__src_pmd)) {
++			if (pmd_none(*dst_pmd))
++				goto next;
++			if (pmd_large(*dst_pmd)) {
++				spin_lock(&init_mm.page_table_lock);
++				set_pmd(dst_pmd, __pmd(0));
++				spin_unlock(&init_mm.page_table_lock);
++				goto next;
++			}
++			__src_pmd = NULL;
++		}
++
++		if (__src_pmd && pmd_large(*__src_pmd)) {
++			pmdval_t val;
++
++			if (pmd_large(*dst_pmd)) {
++				/*
++				 * Sanity check: PFNs must match between source
++				 * and destination even if the rest doesn't.
++				 */
++				BUG_ON(pmd_pfn(*dst_pmd) != pmd_pfn(*__src_pmd));
++			} else if (!pmd_none(*dst_pmd)) {
++				/*
++				 * Page table is replaced with a PMD page.
++				 * Free and unmap the page table.
++				 */
++				__free_page(pmd_page(*dst_pmd));
++				spin_lock(&init_mm.page_table_lock);
++				pmd_clear(dst_pmd);
++				spin_unlock(&init_mm.page_table_lock);
++			}
++
++			/* Copy entry, but set KeyID. */
++			val = pmd_val(*__src_pmd) | keyid << mktme_keyid_shift();
++			val &= __supported_pte_mask;
++			spin_lock(&init_mm.page_table_lock);
++			set_pmd(dst_pmd, __pmd(val));
++			spin_unlock(&init_mm.page_table_lock);
++			goto next;
++		}
++
++		ret = sync_direct_mapping_pte(keyid, dst_pmd, __src_pmd,
++				addr, next);
++next:
++		addr = next;
++		dst_pmd++;
++		if (src_pmd)
++			src_pmd++;
++	} while (addr != end && !ret);
++
++	if (new_pmd) {
++		spin_lock(&init_mm.page_table_lock);
++		pud_populate(&init_mm, dst_pud, new_pmd);
++		spin_unlock(&init_mm.page_table_lock);
++	}
++
++	if (remove_pmd) {
++		spin_lock(&init_mm.page_table_lock);
++		__free_page(pud_page(*dst_pud));
++		pud_clear(dst_pud);
++		spin_unlock(&init_mm.page_table_lock);
++	}
++
++	return ret;
++}
++
++static int sync_direct_mapping_pud(unsigned long keyid,
++		p4d_t *dst_p4d, p4d_t *src_p4d,
++		unsigned long addr, unsigned long end)
++{
++	pud_t *src_pud, *dst_pud;
++	pud_t *new_pud = NULL;
++	bool remove_pud = false;
++	unsigned long next;
++	int ret = 0;
++
++	/*
++	 * We want to unmap and free the page table if the source is empty and
++	 * the range covers whole page table.
++	 */
++	remove_pud = !src_p4d && IS_ALIGNED(addr, P4D_SIZE) && IS_ALIGNED(end, P4D_SIZE);
++
++	/*
++	 * P4D page got split into page table.
++	 * Clear P4D mapping. Page table will be established instead.
++	 */
++	if (p4d_large(*dst_p4d)) {
++		spin_lock(&init_mm.page_table_lock);
++		p4d_clear(dst_p4d);
++		spin_unlock(&init_mm.page_table_lock);
++	}
++
++	/* Allocate a new page table if needed. */
++	if (p4d_none(*dst_p4d)) {
++		new_pud = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
++		if (!new_pud)
++			return -ENOMEM;
++		dst_pud = new_pud + pud_index(addr + keyid * direct_mapping_size);
++	} else {
++		dst_pud = pud_offset(dst_p4d, addr + keyid * direct_mapping_size);
++	}
++	src_pud = src_p4d ? pud_offset(src_p4d, addr) : NULL;
++
++	do {
++		pud_t *__src_pud = src_pud;
++
++		next = pud_addr_end(addr, end);
++		if (!__src_pud || pud_none(*__src_pud)) {
++			if (pud_none(*dst_pud))
++				goto next;
++			if (pud_large(*dst_pud)) {
++				spin_lock(&init_mm.page_table_lock);
++				set_pud(dst_pud, __pud(0));
++				spin_unlock(&init_mm.page_table_lock);
++				goto next;
++			}
++			__src_pud = NULL;
++		}
++
++		if (__src_pud && pud_large(*__src_pud)) {
++			pudval_t val;
++
++			if (pud_large(*dst_pud)) {
++				/*
++				 * Sanity check: PFNs must match between source
++				 * and destination even if the rest doesn't.
++				 */
++				BUG_ON(pud_pfn(*dst_pud) != pud_pfn(*__src_pud));
++			} else if (!pud_none(*dst_pud)) {
++				/*
++				 * Page table is replaced with a pud page.
++				 * Free and unmap the page table.
++				 */
++				__free_page(pud_page(*dst_pud));
++				spin_lock(&init_mm.page_table_lock);
++				pud_clear(dst_pud);
++				spin_unlock(&init_mm.page_table_lock);
++			}
++
++			/* Copy entry, but set KeyID. */
++			val = pud_val(*__src_pud) | keyid << mktme_keyid_shift();
++			val &= __supported_pte_mask;
++			spin_lock(&init_mm.page_table_lock);
++			set_pud(dst_pud, __pud(val));
++			spin_unlock(&init_mm.page_table_lock);
++			goto next;
++		}
++
++		ret = sync_direct_mapping_pmd(keyid, dst_pud, __src_pud,
++				addr, next);
++next:
++		addr = next;
++		dst_pud++;
++		if (src_pud)
++			src_pud++;
++	} while (addr != end && !ret);
++
++	if (new_pud) {
++		spin_lock(&init_mm.page_table_lock);
++		p4d_populate(&init_mm, dst_p4d, new_pud);
++		spin_unlock(&init_mm.page_table_lock);
++	}
++
++	if (remove_pud) {
++		spin_lock(&init_mm.page_table_lock);
++		__free_page(p4d_page(*dst_p4d));
++		p4d_clear(dst_p4d);
++		spin_unlock(&init_mm.page_table_lock);
++	}
++
++	return ret;
++}
++
++static int sync_direct_mapping_p4d(unsigned long keyid,
++		pgd_t *dst_pgd, pgd_t *src_pgd,
++		unsigned long addr, unsigned long end)
++{
++	p4d_t *src_p4d, *dst_p4d;
++	p4d_t *new_p4d_1 = NULL, *new_p4d_2 = NULL;
++	bool remove_p4d = false;
++	unsigned long next;
++	int ret = 0;
++
++	/*
++	 * We want to unmap and free the page table if the source is empty and
++	 * the range covers whole page table.
++	 */
++	remove_p4d = !src_pgd && IS_ALIGNED(addr, PGDIR_SIZE) && IS_ALIGNED(end, PGDIR_SIZE);
++
++	/* Allocate a new page table if needed. */
++	if (pgd_none(*dst_pgd)) {
++		new_p4d_1 = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
++		if (!new_p4d_1)
++			return -ENOMEM;
++		dst_p4d = new_p4d_1 + p4d_index(addr + keyid * direct_mapping_size);
++	} else {
++		dst_p4d = p4d_offset(dst_pgd, addr + keyid * direct_mapping_size);
++	}
++	src_p4d = src_pgd ? p4d_offset(src_pgd, addr) : NULL;
++
++	do {
++		p4d_t *__src_p4d = src_p4d;
++
++		next = p4d_addr_end(addr, end);
++		if (!__src_p4d || p4d_none(*__src_p4d)) {
++			if (p4d_none(*dst_p4d))
++				goto next;
++			__src_p4d = NULL;
++		}
++
++		ret = sync_direct_mapping_pud(keyid, dst_p4d, __src_p4d,
++				addr, next);
++next:
++		addr = next;
++		dst_p4d++;
++
++		/*
++		 * Direct mappings are 1TiB-aligned. With 5-level paging it
++		 * means that on PGD level there can be misalignment between
++		 * source and distiantion.
++		 *
++		 * Allocate the new page table if dst_p4d crosses page table
++		 * boundary.
++		 */
++		if (!((unsigned long)dst_p4d & ~PAGE_MASK) && addr != end) {
++			if (pgd_none(dst_pgd[1])) {
++				new_p4d_2 = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
++				if (!new_p4d_2)
++					ret = -ENOMEM;
++				dst_p4d = new_p4d_2;
++			} else {
++				dst_p4d = p4d_offset(dst_pgd + 1, 0);
++			}
++		}
++		if (src_p4d)
++			src_p4d++;
++	} while (addr != end && !ret);
++
++	if (new_p4d_1 || new_p4d_2) {
++		spin_lock(&init_mm.page_table_lock);
++		if (new_p4d_1)
++			pgd_populate(&init_mm, dst_pgd, new_p4d_1);
++		if (new_p4d_2)
++			pgd_populate(&init_mm, dst_pgd + 1, new_p4d_2);
++		spin_unlock(&init_mm.page_table_lock);
++	}
++
++	if (remove_p4d) {
++		spin_lock(&init_mm.page_table_lock);
++		__free_page(pgd_page(*dst_pgd));
++		pgd_clear(dst_pgd);
++		spin_unlock(&init_mm.page_table_lock);
++	}
++
++	return ret;
++}
++
++static int sync_direct_mapping_keyid(unsigned long keyid,
++		unsigned long addr, unsigned long end)
++{
++	pgd_t *src_pgd, *dst_pgd;
++	unsigned long next;
++	int ret = 0;
++
++	dst_pgd = pgd_offset_k(addr + keyid * direct_mapping_size);
++	src_pgd = pgd_offset_k(addr);
++
++	do {
++		pgd_t *__src_pgd = src_pgd;
++
++		next = pgd_addr_end(addr, end);
++		if (pgd_none(*__src_pgd)) {
++			if (pgd_none(*dst_pgd))
++				continue;
++			__src_pgd = NULL;
++		}
++
++		ret = sync_direct_mapping_p4d(keyid, dst_pgd, __src_pgd,
++				addr, next);
++	} while (dst_pgd++, src_pgd++, addr = next, addr != end && !ret);
++
++	return ret;
++}
++
++/*
++ * For MKTME we maintain per-KeyID direct mappings. This allows kernel to have
++ * access to encrypted memory.
++ *
++ * sync_direct_mapping() sync per-KeyID direct mappings with a canonical
++ * one -- KeyID-0.
++ *
++ * The function tracks changes in the canonical mapping:
++ *  - creating or removing chunks of the translation tree;
++ *  - changes in mapping flags (i.e. protection bits);
++ *  - splitting huge page mapping into a page table;
++ *  - replacing page table with a huge page mapping;
++ *
++ * The function need to be called on every change to the direct mapping:
++ * hotplug, hotremove, changes in permissions bits, etc.
++ *
++ * The function is nop until MKTME is enabled.
++ */
++int sync_direct_mapping(unsigned long start, unsigned long end)
++{
++	int i, ret = 0;
++
++	if (!mktme_enabled())
++		return 0;
++
++	for (i = 1; !ret && i <= mktme_nr_keyids(); i++)
++		ret = sync_direct_mapping_keyid(i, start, end);
++
++	flush_tlb_all();
++
++	return ret;
++}
+diff --git a/arch/x86/mm/pat/set_memory.c b/arch/x86/mm/pat/set_memory.c
+index ad8a5c586a35..a059c8672fd7 100644
+--- a/arch/x86/mm/pat/set_memory.c
++++ b/arch/x86/mm/pat/set_memory.c
+@@ -29,6 +29,7 @@
+ #include <asm/proto.h>
+ #include <asm/memtype.h>
+ #include <asm/set_memory.h>
++#include <asm/mktme.h>
+ 
+ #include "../mm_internal.h"
+ 
+@@ -363,6 +364,33 @@ static void cpa_flush(struct cpa_data *data, int cache)
+ 	unsigned int i;
+ 
+ 	BUG_ON(irqs_disabled() && !early_boot_irqs_disabled);
++ 
++	if (mktme_enabled()) {
++		unsigned long start, end;
++
++		start = PAGE_OFFSET + (cpa->pfn << PAGE_SHIFT);
++		end = start + cpa->numpages * PAGE_SIZE;
++
++		/* Round to cover huge page possibly split by the change */
++		start = round_down(start, direct_gbpages ? PUD_SIZE : PMD_SIZE);
++		end = round_up(end, direct_gbpages ? PUD_SIZE : PMD_SIZE);
++
++		/* Sync all direct mapping for an array */
++		if (cpa->flags & CPA_ARRAY) {
++			start = PAGE_OFFSET;
++			end = PAGE_OFFSET + direct_mapping_size;
++		}
++
++		/*
++		 * Sync per-KeyID direct mappings with the canonical one
++		 * (KeyID-0).
++		 *
++		 * sync_direct_mapping() does full TLB flush.
++		 */
++		sync_direct_mapping(start, end);
++		if (!cache)
++			return;
++	}
+ 
+ 	if (cache && !static_cpu_has(X86_FEATURE_CLFLUSH)) {
+ 		cpa_flush_all(cache);
+@@ -1546,6 +1574,13 @@ static int __change_page_attr(struct cpa_data *cpa, int primary)
+ 
+ 		new_prot = pgprot_clear_protnone_bits(new_prot);
+ 
++		/*
++		 * TODO if the page was encrypted and no longer is we may want to
++		 * call clear_page which re-initializes the page with keyid0
++		 * __pgprot(_PAGE_ENC)
++		 * Not sure if we should do this here or somewhere else
++		*/
++
+ 		/*
+ 		 * We need to keep the pfn from the existing PTE,
+ 		 * after all we're only going to change it's attributes
+diff --git a/drivers/acpi/apei/ghes.c b/drivers/acpi/apei/ghes.c
+index 0c8330ed1ffd..b9c05a5a1726 100644
+--- a/drivers/acpi/apei/ghes.c
++++ b/drivers/acpi/apei/ghes.c
+@@ -51,6 +51,9 @@
+ 
+ #include "apei-internal.h"
+ 
++// extern phys_addr_t __mktme_keyid_mask;
++extern phys_addr_t mktme_keyid_mask(void);
++
+ #define GHES_PFX	"GHES: "
+ 
+ #define GHES_ESTATUS_MAX_SIZE		65536
+@@ -448,7 +451,7 @@ static bool ghes_do_memory_failure(u64 physical_addr, int flags)
+ 	if (!IS_ENABLED(CONFIG_ACPI_APEI_MEMORY_FAILURE))
+ 		return false;
+ 
+-	pfn = PHYS_PFN(physical_addr);
++	pfn = PHYS_PFN(physical_addr & ~mktme_keyid_mask());
+ 	if (!pfn_valid(pfn)) {
+ 		pr_warn_ratelimited(FW_WARN GHES_PFX
+ 		"Invalid address in generic error data: %#llx\n",
+diff --git a/drivers/acpi/numa/hmat.c b/drivers/acpi/numa/hmat.c
+index c3d783aca196..91653b67a768 100644
+--- a/drivers/acpi/numa/hmat.c
++++ b/drivers/acpi/numa/hmat.c
+@@ -863,3 +863,71 @@ static __init int hmat_init(void)
+ 	return 0;
+ }
+ device_initcall(hmat_init);
++
++
++bool acpi_hmat_present(void)
++{
++	struct acpi_table_header *tbl;
++	acpi_status status;
++
++	status = acpi_get_table(ACPI_SIG_HMAT, 0, &tbl);
++	if (ACPI_FAILURE(status))
++		return false;
++
++	acpi_put_table(tbl);
++	return true;
++}
++
++static int mktme_parse_proximity_domains(union acpi_subtable_headers *header,
++					 const unsigned long end)
++{
++	struct acpi_hmat_proximity_domain *mar = (void *)header;
++	struct acpi_hmat_structure *hdr = (void *)header;
++
++	const struct cpumask *tmp_mask;
++
++	if (!hdr || hdr->type != ACPI_HMAT_TYPE_PROXIMITY)
++		return -EINVAL;
++
++	if (mar->header.length != sizeof(*mar)) {
++		pr_warn("MKTME: invalid header length in HMAT\n");
++		return -1;
++	}
++	/*
++	 * Require a valid processor proximity domain.
++	 * This will catch memory only physical packages with
++	 * no processor capable of programming the key table.
++	 */
++	if (!(mar->flags & ACPI_HMAT_PROCESSOR_PD_VALID)) {
++		pr_warn("MKTME: no valid processor proximity domain\n");
++		return -1;
++	}
++	/* Require an online CPU in the processor proximity domain. */
++	tmp_mask = cpumask_of_node(pxm_to_node(mar->processor_PD));
++	if (!cpumask_intersects(tmp_mask, cpu_online_mask)) {
++		pr_warn("MKTME: no online CPU in proximity domain\n");
++		return -1;
++	}
++	return 0;
++}
++
++/* Returns true if topology is safe for MKTME key creation */
++bool mktme_hmat_evaluate(void)
++{
++	struct acpi_table_header *tbl;
++	bool ret = true;
++	acpi_status status;
++
++	status = acpi_get_table(ACPI_SIG_HMAT, 0, &tbl);
++	if (ACPI_FAILURE(status))
++		return -EINVAL;
++
++	if (acpi_table_parse_entries(ACPI_SIG_HMAT,
++				     sizeof(struct acpi_table_hmat),
++				     ACPI_HMAT_TYPE_PROXIMITY,
++				     mktme_parse_proximity_domains, 0) < 0) {
++		ret = false;
++	}
++	acpi_put_table(tbl);
++	return ret;
++}
+diff --git a/drivers/acpi/tables.c b/drivers/acpi/tables.c
+index 71419eb16e09..f0d0a86defda 100644
+--- a/drivers/acpi/tables.c
++++ b/drivers/acpi/tables.c
+@@ -35,7 +35,7 @@ static char *mps_inti_flags_trigger[] = { "dfl", "edge", "res", "level" };
+ 
+ static struct acpi_table_desc initial_tables[ACPI_MAX_TABLES] __initdata;
+ 
+-static int acpi_apic_instance __initdata;
++static int acpi_apic_instance;
+ 
+ enum acpi_subtable_type {
+ 	ACPI_SUBTABLE_COMMON,
+@@ -52,7 +52,7 @@ struct acpi_subtable_entry {
+  * Disable table checksum verification for the early stage due to the size
+  * limitation of the current x86 early mapping implementation.
+  */
+-static bool acpi_verify_table_checksum __initdata = false;
++static bool acpi_verify_table_checksum = false;
+ 
+ void acpi_table_print_madt_entry(struct acpi_subtable_header *header)
+ {
+@@ -291,7 +291,7 @@ acpi_get_subtable_type(char *id)
+  * On success returns sum of all matching entries for all proc handlers.
+  * Otherwise, -ENODEV or -EINVAL is returned.
+  */
+-static int __init acpi_parse_entries_array(char *id, unsigned long table_size,
++static int acpi_parse_entries_array(char *id, unsigned long table_size,
+ 		struct acpi_table_header *table_header,
+ 		struct acpi_subtable_proc *proc, int proc_num,
+ 		unsigned int max_entries)
+@@ -352,7 +352,7 @@ static int __init acpi_parse_entries_array(char *id, unsigned long table_size,
+ 	return errs ? -EINVAL : count;
+ }
+ 
+-int __init acpi_table_parse_entries_array(char *id,
++int acpi_table_parse_entries_array(char *id,
+ 			 unsigned long table_size,
+ 			 struct acpi_subtable_proc *proc, int proc_num,
+ 			 unsigned int max_entries)
+@@ -386,7 +386,7 @@ int __init acpi_table_parse_entries_array(char *id,
+ 	return count;
+ }
+ 
+-int __init acpi_table_parse_entries(char *id,
++int acpi_table_parse_entries(char *id,
+ 			unsigned long table_size,
+ 			int entry_id,
+ 			acpi_tbl_entry_handler handler,
+diff --git a/drivers/iommu/intel/iommu.c b/drivers/iommu/intel/iommu.c
+index d75f59ae28e6..b315ac16f3bc 100644
+--- a/drivers/iommu/intel/iommu.c
++++ b/drivers/iommu/intel/iommu.c
+@@ -991,6 +991,29 @@ static void free_context_table(struct intel_iommu *iommu)
+ out:
+ 	spin_unlock_irqrestore(&iommu->lock, flags);
+ }
++ 
++static inline void set_pte_mktme_keyid(unsigned long phys_pfn,
++		phys_addr_t *pteval)
++{
++	unsigned long keyid;
++
++	if (!pfn_valid(phys_pfn))
++		return;
++
++	keyid = page_keyid(pfn_to_page(phys_pfn));
++
++#ifdef CONFIG_X86_INTEL_MKTME
++	/*
++	 * When MKTME is enabled, set keyid in PTE such that DMA
++	 * remapping will include keyid in the translation from IOVA
++	 * to physical address. This applies to both user and kernel
++	 * allocated DMA memory.
++	 */
++	*pteval &= ~mktme_keyid_mask();
++	*pteval |= keyid << mktme_keyid_shift();
++#endif
++}
++
+ 
+ static struct dma_pte *pfn_to_dma_pte(struct dmar_domain *domain,
+ 				      unsigned long pfn, int *target_level)
+@@ -1018,7 +1041,7 @@ static struct dma_pte *pfn_to_dma_pte(struct dmar_domain *domain,
+ 			break;
+ 
+ 		if (!dma_pte_present(pte)) {
+-			uint64_t pteval;
++			phys_addr_t pteval;
+ 
+ 			tmp_page = alloc_pgtable_page(domain->nid);
+ 
+@@ -1026,7 +1049,8 @@ static struct dma_pte *pfn_to_dma_pte(struct dmar_domain *domain,
+ 				return NULL;
+ 
+ 			domain_flush_cache(domain, tmp_page, VTD_PAGE_SIZE);
+-			pteval = ((uint64_t)virt_to_dma_pfn(tmp_page) << VTD_PAGE_SHIFT) | DMA_PTE_READ | DMA_PTE_WRITE;
++			pteval = (virt_to_dma_pfn(tmp_page) << VTD_PAGE_SHIFT) | DMA_PTE_READ | DMA_PTE_WRITE;
++			set_pte_mktme_keyid(virt_to_dma_pfn(tmp_page), &pteval);
+ 			if (domain_use_first_level(domain)) {
+ 				pteval |= DMA_FL_PTE_XD | DMA_FL_PTE_US;
+ 				if (iommu_is_dma_domain(&domain->domain))
+@@ -2366,6 +2390,8 @@ __domain_mapping(struct dmar_domain *domain, unsigned long iov_pfn,
+ 			}
+ 
+ 		}
++		set_pte_mktme_keyid(phys_pfn, &pteval);
++
+ 		/* We don't need lock here, nobody else
+ 		 * touches the iova range
+ 		 */
+diff --git a/fs/dax.c b/fs/dax.c
+index 4e3e5a283a91..730ed118b923 100644
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@ -1107,6 +1107,7 @@ static vm_fault_t dax_pmd_load_hole(struct xa_state *xas, struct vm_fault *vmf,
+ 	}
+ 	pmd_entry = mk_pmd(zero_page, vmf->vma->vm_page_prot);
+ 	pmd_entry = pmd_mkhuge(pmd_entry);
++	pmd_entry = mk_zero_pmd(zero_page, vmf->vma->vm_page_prot);
+ 	set_pmd_at(vmf->vma->vm_mm, pmd_addr, vmf->pmd, pmd_entry);
+ 	spin_unlock(ptl);
+ 	trace_dax_pmd_load_hole(inode, vmf, zero_page, *entry);
+diff --git a/fs/exec.c b/fs/exec.c
+index a098c133d8d7..65cc2d315026 100644
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@ -807,7 +807,7 @@ int setup_arg_pages(struct linux_binprm *bprm,
+ 	vm_flags |= VM_STACK_INCOMPLETE_SETUP;
+ 
+ 	ret = mprotect_fixup(vma, &prev, vma->vm_start, vma->vm_end,
+-			vm_flags);
++			vm_flags, -1, 0);
+ 	if (ret)
+ 		goto out_unlock;
+ 	BUG_ON(prev != vma);
+diff --git a/fs/userfaultfd.c b/fs/userfaultfd.c
+index 22bf14ab2d16..ff31812e9eb5 100644
+--- a/fs/userfaultfd.c
++++ b/fs/userfaultfd.c
+@@ -877,7 +877,7 @@ static int userfaultfd_release(struct inode *inode, struct file *file)
+ 				 new_flags, vma->anon_vma,
+ 				 vma->vm_file, vma->vm_pgoff,
+ 				 vma_policy(vma),
+-				 NULL_VM_UFFD_CTX);
++				 NULL_VM_UFFD_CTX, vma_keyid(vma));
+ 		if (prev)
+ 			vma = prev;
+ 		else
+@@ -1436,7 +1436,8 @@ static int userfaultfd_register(struct userfaultfd_ctx *ctx,
+ 		prev = vma_merge(mm, prev, start, vma_end, new_flags,
+ 				 vma->anon_vma, vma->vm_file, vma->vm_pgoff,
+ 				 vma_policy(vma),
+-				 ((struct vm_userfaultfd_ctx){ ctx }));
++				 ((struct vm_userfaultfd_ctx){ ctx }), 
++				 vma_keyid(vma));
+ 		if (prev) {
+ 			vma = prev;
+ 			goto next;
+@@ -1613,7 +1614,7 @@ static int userfaultfd_unregister(struct userfaultfd_ctx *ctx,
+ 		prev = vma_merge(mm, prev, start, vma_end, new_flags,
+ 				 vma->anon_vma, vma->vm_file, vma->vm_pgoff,
+ 				 vma_policy(vma),
+-				 NULL_VM_UFFD_CTX);
++				 NULL_VM_UFFD_CTX, vma_keyid(vma));
+ 		if (prev) {
+ 			vma = prev;
+ 			goto next;
+diff --git a/include/asm-generic/page.h b/include/asm-generic/page.h
+index 6fc47561814c..9a50fe27207c 100644
+--- a/include/asm-generic/page.h
++++ b/include/asm-generic/page.h
+@@ -25,8 +25,44 @@
+ 
+ #ifndef __ASSEMBLY__
+ 
++
++#ifdef CONFIG_X86_INTEL_MKTME
++static inline void _movdir64b(void *dst, const void *src)
++{
++	// assert((uintptr_t)src == (uintptr_t)((uintptr_t)src & ~(64-1)));
++	// assert((uintptr_t)dst == (uintptr_t)((uintptr_t)dst & ~(64-1)));
++	const struct { char _[64]; } *__src = src;
++	struct { char _[64]; } *__dst = dst;
++
++	asm volatile(".byte 0x66, 0x0f, 0x38, 0xf8, 0x02"
++		     : "+m" (*__dst)
++		     :  "m" (*__src), "a" (__dst), "d" (__src));
++}
++static inline void clear_page(void *page)
++{
++	uint8_t* dst = (uint8_t*)page;
++	__attribute__((aligned(64))) const uint8_t ZeroBlock[64] = { 0 };
++	for (uint32_t block = 0; block < (4096 / 64); block++) {
++		_movdir64b(dst, ZeroBlock);
++		dst += 64;
++	}
++	asm volatile("mfence");
++}
++static inline void copy_page(void *to, void* from)
++{
++	uint8_t* dst = (uint8_t*)to;
++	uint8_t* src = (uint8_t*)from;
++	for (uint32_t block = 0; block < (4096 / 64); block++) {
++		_movdir64b(dst, src);
++		dst += 64;
++		src += 64;
++	}
++	asm volatile("mfence");
++}
++#else
+ #define clear_page(page)	memset((page), 0, PAGE_SIZE)
+ #define copy_page(to,from)	memcpy((to), (from), PAGE_SIZE)
++#endif
+ 
+ #define clear_user_page(page, vaddr, pg)	clear_page(page)
+ #define copy_user_page(to, from, vaddr, pg)	copy_page(to, from)
+diff --git a/include/keys/mktme-type.h b/include/keys/mktme-type.h
+new file mode 100644
+index 000000000000..97ec6d4a3a17
+--- /dev/null
++++ b/include/keys/mktme-type.h
+@@ -0,0 +1,54 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++/* Key service for Multi-KEY Total Memory Encryption */
++
++#ifndef _KEYS_MKTME_TYPE_H
++#define _KEYS_MKTME_TYPE_H
++
++#include <linux/key.h>
++
++enum mktme_alg {
++	MKTME_ALG_AES_XTS_128,
++	MKTME_ALG_AES_XTS_128_I,
++	MKTME_ALG_AES_XTS_256,
++	MKTME_ALG_3,
++	MKTME_ALG_4,
++	MKTME_ALG_5,
++	MKTME_ALG_6,
++	MKTME_ALG_7,
++};
++
++const char *const mktme_alg_names[] = {
++	[MKTME_ALG_AES_XTS_128]	= "aes-xts-128",
++	[MKTME_ALG_AES_XTS_128_I]	= "aes-xts-128-i",
++	[MKTME_ALG_AES_XTS_256]	= "aes-xts-256",
++	[MKTME_ALG_3]	= "mktme-alg-3-unsupported",
++	[MKTME_ALG_4]	= "mktme-alg-4-unsupported",
++	[MKTME_ALG_5]	= "mktme-alg-5-unsupported",
++	[MKTME_ALG_6]	= "mktme-alg-6-unsupported",
++	[MKTME_ALG_7]	= "mktme-alg-7-unsupported",
++};
++
++enum mktme_type {
++	MKTME_TYPE_ERROR = -1,
++	MKTME_TYPE_CPU,
++	MKTME_TYPE_NO_ENCRYPT,
++	MKTME_TYPE_CLEAR,
++	MKTME_TYPE_DIRECT,
++};
++
++const char *const mktme_type_names[] = {
++	[MKTME_TYPE_CPU]	= "cpu",
++	[MKTME_TYPE_NO_ENCRYPT]	= "no-encrypt",
++	[MKTME_TYPE_CLEAR]	= "clear",
++	[MKTME_TYPE_DIRECT]	= "direct",
++};
++
++#define PAYLOAD_ALG_SHIFT 8
++//#define PAYLOAD_ALG_MASK  0xffff
++//#define PAYLOAD_CMD_SHIFT 0
++//#define PAYLOAD_CMD_MASK  0xff
++
++extern struct key_type key_type_mktme;
++
++#endif /* _KEYS_MKTME_TYPE_H */
+diff --git a/include/linux/acpi.h b/include/linux/acpi.h
+index 974d497a897d..8955c5a9fe60 100644
+--- a/include/linux/acpi.h
++++ b/include/linux/acpi.h
+@@ -233,11 +233,11 @@ void acpi_reserve_initial_tables (void);
+ void acpi_table_init_complete (void);
+ int acpi_table_init (void);
+ int acpi_table_parse(char *id, acpi_tbl_table_handler handler);
+-int __init acpi_table_parse_entries(char *id, unsigned long table_size,
++int acpi_table_parse_entries(char *id, unsigned long table_size,
+ 			      int entry_id,
+ 			      acpi_tbl_entry_handler handler,
+ 			      unsigned int max_entries);
+-int __init acpi_table_parse_entries_array(char *id, unsigned long table_size,
++int acpi_table_parse_entries_array(char *id, unsigned long table_size,
+ 			      struct acpi_subtable_proc *proc, int proc_num,
+ 			      unsigned int max_entries);
+ int acpi_table_parse_madt(enum acpi_madt_type id,
+@@ -1386,5 +1386,10 @@ extern void acpi_device_notify_remove(struct device *dev);
+ static inline void acpi_device_notify(struct device *dev) { }
+ static inline void acpi_device_notify_remove(struct device *dev) { }
+ #endif
++ 
++#ifdef CONFIG_X86_INTEL_MKTME
++extern bool acpi_hmat_present(void);
++extern bool mktme_hmat_evaluate(void);
++#endif /* CONFIG_X86_INTEL_MKTME */
+ 
+ #endif	/*_LINUX_ACPI_H*/
+diff --git a/include/linux/dma-direct.h b/include/linux/dma-direct.h
+index 18aade195884..c2425cb2fc43 100644
+--- a/include/linux/dma-direct.h
++++ b/include/linux/dma-direct.h
+@@ -71,7 +71,8 @@ static inline dma_addr_t phys_to_dma_unencrypted(struct device *dev,
+  */
+ static inline dma_addr_t phys_to_dma(struct device *dev, phys_addr_t paddr)
+ {
+-	return __sme_set(phys_to_dma_unencrypted(dev, paddr));
++	// return __mem_encrypt_dma_set(__phys_to_dma(dev, paddr), paddr);
++	return __mem_encrypt_dma_set(phys_to_dma_unencrypted(dev, paddr), paddr);
+ }
+ 
+ static inline phys_addr_t dma_to_phys(struct device *dev, dma_addr_t dma_addr)
+@@ -83,7 +84,7 @@ static inline phys_addr_t dma_to_phys(struct device *dev, dma_addr_t dma_addr)
+ 	else
+ 		paddr = dma_addr;
+ 
+-	return __sme_clr(paddr);
++	return __mem_encrypt_dma_clear(paddr);
+ }
+ #endif /* !CONFIG_ARCH_HAS_PHYS_TO_DMA */
+ 
+diff --git a/include/linux/gfp.h b/include/linux/gfp.h
+index 55b2ec1f965a..d2007f13726c 100644
+--- a/include/linux/gfp.h
++++ b/include/linux/gfp.h
+@@ -526,10 +526,42 @@ static inline int arch_make_page_accessible(struct page *page)
+ 	return 0;
+ }
+ #endif
++ 
++#ifndef prep_encrypted_page
++/*
++ * An architecture may override the helper to prepare the page
++ * to be used for with specific KeyID. To be called on encrypted
++ * page allocation.
++ */
++static inline void prep_encrypted_page(struct page *page, int order,
++		int keyid, bool zero)
++{
++}
++#endif
++
++/*
++ * Encrypted page has to be cleared once keyid is set, not on allocation.
++ */
++static inline bool deferred_page_zero(int keyid, gfp_t *gfp_mask)
++{
++	if (keyid && (*gfp_mask & __GFP_ZERO)) {
++		*gfp_mask &= ~__GFP_ZERO;
++		return true;
++	}
++
++	return false;
++}
++
+ 
+ struct page *__alloc_pages(gfp_t gfp, unsigned int order, int preferred_nid,
+ 		nodemask_t *nodemask);
+ 
++struct page *__alloc_pages_keyid(gfp_t gfp, unsigned int order, int preferred_nid,
++		nodemask_t *nodemask, int keyid);
++
++struct page *__alloc_pages_node_keyid(int nid, int keyid,
++		gfp_t gfp_mask, unsigned int order);
++
+ unsigned long __alloc_pages_bulk(gfp_t gfp, int preferred_nid,
+ 				nodemask_t *nodemask, int nr_pages,
+ 				struct list_head *page_list,
+@@ -584,23 +616,38 @@ static inline struct page *alloc_pages_node(int nid, gfp_t gfp_mask,
+ 	return __alloc_pages_node(nid, gfp_mask, order);
+ }
+ 
+-#ifdef CONFIG_NUMA
+-struct page *alloc_pages(gfp_t gfp, unsigned int order);
++/*
++static inline struct page *alloc_pages_node_keyid(int nid, int keyid,
++		gfp_t gfp_mask, unsigned int order)
++{
++	if (nid == NUMA_NO_NODE)
++		nid = numa_mem_id();
++
++	return __alloc_pages_node_keyid(nid, keyid, gfp_mask, order);
++}
++*/
++
+ extern struct page *alloc_pages_vma(gfp_t gfp_mask, int order,
+ 			struct vm_area_struct *vma, unsigned long addr,
+ 			int node, bool hugepage);
++extern struct page *alloc_pages_vma_keyid(gfp_t gfp_mask, int order,
++			struct vm_area_struct *vma, unsigned long addr,
++			int node, bool hugepage, int keyid);
++
++#ifdef CONFIG_NUMA
++struct page *alloc_pages(gfp_t gfp, unsigned int order);
++
+ #define alloc_hugepage_vma(gfp_mask, vma, addr, order) \
+ 	alloc_pages_vma(gfp_mask, order, vma, addr, numa_node_id(), true)
+-#else
++#else /*CONFIG_NUMA*/
+ static inline struct page *alloc_pages(gfp_t gfp_mask, unsigned int order)
+ {
+ 	return alloc_pages_node(numa_node_id(), gfp_mask, order);
+ }
+-#define alloc_pages_vma(gfp_mask, order, vma, addr, node, false)\
+-	alloc_pages(gfp_mask, order)
+ #define alloc_hugepage_vma(gfp_mask, vma, addr, order) \
+ 	alloc_pages(gfp_mask, order)
+-#endif
++#endif /*CONFIG_NUMA*/
++
+ #define alloc_page(gfp_mask) alloc_pages(gfp_mask, 0)
+ #define alloc_page_vma(gfp_mask, vma, addr)			\
+ 	alloc_pages_vma(gfp_mask, 0, vma, addr, numa_node_id(), false)
+diff --git a/include/linux/highmem.h b/include/linux/highmem.h
+index b4c49f9cc379..1c8c2ce7e6e1 100644
+--- a/include/linux/highmem.h
++++ b/include/linux/highmem.h
+@@ -178,6 +178,7 @@ alloc_zeroed_user_highpage_movable(struct vm_area_struct *vma,
+ static inline void clear_highpage(struct page *page)
+ {
+ 	void *kaddr = kmap_atomic(page);
++	//TODO assert that keyID is 0
+ 	clear_page(kaddr);
+ 	kunmap_atomic(kaddr);
+ }
+diff --git a/include/linux/intel-iommu.h b/include/linux/intel-iommu.h
+index 05a65eb155f7..dd23a43f0270 100644
+--- a/include/linux/intel-iommu.h
++++ b/include/linux/intel-iommu.h
+@@ -24,6 +24,7 @@
+ 
+ #include <asm/cacheflush.h>
+ #include <asm/iommu.h>
++#include <asm/page.h>
+ 
+ /*
+  * VT-d hardware uses 4KiB page size regardless of host page size.
+@@ -690,7 +691,15 @@ static inline void dma_clear_pte(struct dma_pte *pte)
+ static inline u64 dma_pte_addr(struct dma_pte *pte)
+ {
+ #ifdef CONFIG_64BIT
+-	return pte->val & VTD_PAGE_MASK & (~DMA_FL_PTE_XD);
++	// return pte->val & VTD_PAGE_MASK & (~DMA_FL_PTE_XD);
++// -	return pte->val & VTD_PAGE_MASK;
++	u64 addr = pte->val;
++	// addr &= VTD_PAGE_MASK;
++	addr &= VTD_PAGE_MASK & (~DMA_FL_PTE_XD);
++#ifdef CONFIG_X86_INTEL_MKTME
++	addr &= ~mktme_keyid_mask();
++#endif
++	return addr;
+ #else
+ 	/* Must have a full atomic 64-bit read */
+ 	return  __cmpxchg64(&pte->val, 0ULL, 0ULL) &
+diff --git a/include/linux/mem_encrypt.h b/include/linux/mem_encrypt.h
+index 5c4a18a91f89..e9610973f339 100644
+--- a/include/linux/mem_encrypt.h
++++ b/include/linux/mem_encrypt.h
+@@ -18,23 +18,21 @@
+ 
+ #else	/* !CONFIG_ARCH_HAS_MEM_ENCRYPT */
+ 
++ 
++static inline dma_addr_t __mem_encrypt_dma_set(dma_addr_t daddr, phys_addr_t paddr)
++{
++	return daddr;
++}
++
++static inline phys_addr_t __mem_encrypt_dma_clear(phys_addr_t paddr)
++{
++	return paddr;
++}
++
+ static inline bool mem_encrypt_active(void) { return false; }
+ 
+ #endif	/* CONFIG_ARCH_HAS_MEM_ENCRYPT */
+ 
+-#ifdef CONFIG_AMD_MEM_ENCRYPT
+-/*
+- * The __sme_set() and __sme_clr() macros are useful for adding or removing
+- * the encryption mask from a value (e.g. when dealing with pagetable
+- * entries).
+- */
+-#define __sme_set(x)		((x) | sme_me_mask)
+-#define __sme_clr(x)		((x) & ~sme_me_mask)
+-#else
+-#define __sme_set(x)		(x)
+-#define __sme_clr(x)		(x)
+-#endif
+-
+ #endif	/* __ASSEMBLY__ */
+ 
+ #endif	/* __MEM_ENCRYPT_H__ */
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 73a52aba448f..5cec072ab097 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -200,6 +200,8 @@ static inline void __mm_zero_struct_page(struct page *page)
+  */
+ #define MAPCOUNT_ELF_CORE_MARGIN	(5)
+ #define DEFAULT_MAX_MAP_COUNT	(USHRT_MAX - MAPCOUNT_ELF_CORE_MARGIN)
++//#define DEFAULT_MAX_MAP_COUNT   (ULONG_MAX - MAPCOUNT_ELF_CORE_MARGIN)
++
+ 
+ extern int sysctl_max_map_count;
+ 
+@@ -1736,6 +1738,8 @@ void zap_vma_ptes(struct vm_area_struct *vma, unsigned long address,
+ 		  unsigned long size);
+ void zap_page_range(struct vm_area_struct *vma, unsigned long address,
+ 		    unsigned long size);
++void not_quite_zap_page_range(struct vm_area_struct *vma, unsigned long address,
++		    unsigned long size);
+ void unmap_vmas(struct mmu_gather *tlb, struct vm_area_struct *start_vma,
+ 		unsigned long start, unsigned long end);
+ 
+@@ -1871,6 +1875,21 @@ int clear_page_dirty_for_io(struct page *page);
+ 
+ int get_cmdline(struct task_struct *task, char *buffer, int buflen);
+ 
++ 
++#ifndef vma_keyid
++static inline int vma_keyid(struct vm_area_struct *vma)
++{
++	return 0;
++}
++#endif
++
++#ifndef page_keyid
++static inline int page_keyid(const struct page *page)
++{
++	return 0;
++}
++#endif
++
+ extern unsigned long move_page_tables(struct vm_area_struct *vma,
+ 		unsigned long old_addr, struct vm_area_struct *new_vma,
+ 		unsigned long new_addr, unsigned long len,
+@@ -1897,7 +1916,8 @@ extern unsigned long change_protection(struct vm_area_struct *vma, unsigned long
+ 			      unsigned long cp_flags);
+ extern int mprotect_fixup(struct vm_area_struct *vma,
+ 			  struct vm_area_struct **pprev, unsigned long start,
+-			  unsigned long end, unsigned long newflags);
++			  unsigned long end, unsigned long newflags, int newkeyid, 
++			  unsigned long mprotect_fixup_flags);
+ 
+ /*
+  * doesn't attempt to fault and will return short.
+@@ -2548,7 +2568,7 @@ static inline int vma_adjust(struct vm_area_struct *vma, unsigned long start,
+ extern struct vm_area_struct *vma_merge(struct mm_struct *,
+ 	struct vm_area_struct *prev, unsigned long addr, unsigned long end,
+ 	unsigned long vm_flags, struct anon_vma *, struct file *, pgoff_t,
+-	struct mempolicy *, struct vm_userfaultfd_ctx);
++	struct mempolicy *, struct vm_userfaultfd_ctx, int keyid);
+ extern struct anon_vma *find_mergeable_anon_vma(struct vm_area_struct *);
+ extern int __split_vma(struct mm_struct *, struct vm_area_struct *,
+ 	unsigned long addr, int new_below);
+@@ -3224,6 +3244,16 @@ void __init setup_nr_node_ids(void);
+ #else
+ static inline void setup_nr_node_ids(void) {}
+ #endif
++ 
++#ifndef CONFIG_X86_INTEL_MKTME
++static inline void mprotect_set_encrypt(struct vm_area_struct *vma,
++					int newkeyid,
++					unsigned long start,
++					unsigned long end,
++					unsigned long mprotect_fixup_flags) {}
++static inline void vma_get_encrypt_ref(struct vm_area_struct *vma) {}
++static inline void vma_put_encrypt_ref(struct vm_area_struct *vma) {}
++#endif /* CONFIG_X86_INTEL_MKTME */
+ 
+ extern int memcmp_pages(struct page *page1, struct page *page2);
+ 
+diff --git a/include/linux/mman.h b/include/linux/mman.h
+index b66e91b8176c..b016fe2fe5f0 100644
+--- a/include/linux/mman.h
++++ b/include/linux/mman.h
+@@ -106,7 +106,7 @@ static inline void vm_unacct_memory(long pages)
+  */
+ static inline bool arch_validate_prot(unsigned long prot, unsigned long addr)
+ {
+-	return (prot & ~(PROT_READ | PROT_WRITE | PROT_EXEC | PROT_SEM)) == 0;
++	return (prot & ~(PROT_READ | PROT_WRITE | PROT_EXEC | PROT_SEM | PROT_TODO)) == 0;
+ }
+ #define arch_validate_prot arch_validate_prot
+ #endif
+diff --git a/include/linux/page_ext.h b/include/linux/page_ext.h
+index fabb2e1e087f..f730b61c8e88 100644
+--- a/include/linux/page_ext.h
++++ b/include/linux/page_ext.h
+@@ -23,6 +23,7 @@ enum page_ext_flags {
+ 	PAGE_EXT_YOUNG,
+ 	PAGE_EXT_IDLE,
+ #endif
++	__NR_PAGE_EXT_FLAGS
+ };
+ 
+ /*
+@@ -33,7 +34,15 @@ enum page_ext_flags {
+  * then the page_ext for pfn always exists.
+  */
+ struct page_ext {
+-	unsigned long flags;
++	union {
++		unsigned long flags;
++#ifdef CONFIG_X86_INTEL_MKTME
++		struct {
++			unsigned short __pad;
++			unsigned short keyid;
++		};
++#endif
++	};
+ };
+ 
+ extern unsigned long page_ext_size;
+diff --git a/include/linux/pgtable.h b/include/linux/pgtable.h
+index e24d2c992b11..13a17199c3d5 100644
+--- a/include/linux/pgtable.h
++++ b/include/linux/pgtable.h
+@@ -1172,8 +1172,16 @@ static inline unsigned long my_zero_pfn(unsigned long addr)
+ 	return 0;
+ }
+ #endif /* CONFIG_MMU */
++ 
++#ifndef mk_zero_pte
++#define mk_zero_pte(addr, prot) pte_mkspecial(pfn_pte(my_zero_pfn(addr), prot))
++#endif
+ 
+ #ifdef CONFIG_MMU
++ 
++#ifndef mk_zero_pmd
++#define mk_zero_pmd(zero_page, prot) pmd_mkhuge(mk_pmd(zero_page, prot))
++#endif
+ 
+ #ifndef CONFIG_TRANSPARENT_HUGEPAGE
+ static inline int pmd_trans_huge(pmd_t pmd)
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index 252243c7783d..b854332aaf2e 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -1053,6 +1053,9 @@ asmlinkage long sys_landlock_add_rule(int ruleset_fd, enum landlock_rule_type ru
+ asmlinkage long sys_landlock_restrict_self(int ruleset_fd, __u32 flags);
+ asmlinkage long sys_memfd_secret(unsigned int flags);
+ 
++asmlinkage long sys_encrypt_mprotect(unsigned long start, size_t len,
++				     unsigned long prot, key_serial_t serial);
++
+ /*
+  * Architecture-specific system calls
+  */
+diff --git a/include/uapi/asm-generic/mman-common.h b/include/uapi/asm-generic/mman-common.h
+index 1567a3294c3d..3ef35d58f115 100644
+--- a/include/uapi/asm-generic/mman-common.h
++++ b/include/uapi/asm-generic/mman-common.h
+@@ -12,6 +12,7 @@
+ #define PROT_EXEC	0x4		/* page can be executed */
+ #define PROT_SEM	0x8		/* page may be used for atomic ops */
+ /*			0x10		   reserved for arch-specific use */
++#define PROT_TODO	0x10	/* TODO */
+ /*			0x20		   reserved for arch-specific use */
+ #define PROT_NONE	0x0		/* page can not be accessed */
+ #define PROT_GROWSDOWN	0x01000000	/* mprotect flag: extend change to start of growsdown vma */
+diff --git a/include/uapi/asm-generic/unistd.h b/include/uapi/asm-generic/unistd.h
+index 1c5fb86d455a..18dd773de8dc 100644
+--- a/include/uapi/asm-generic/unistd.h
++++ b/include/uapi/asm-generic/unistd.h
+@@ -880,8 +880,11 @@ __SYSCALL(__NR_memfd_secret, sys_memfd_secret)
+ #define __NR_process_mrelease 448
+ __SYSCALL(__NR_process_mrelease, sys_process_mrelease)
+ 
++#define __NR_encrypt_mprotect 451
++__SYSCALL(__NR_encrypt_mprotect, sys_encrypt_mprotect)
++
+ #undef __NR_syscalls
+-#define __NR_syscalls 449
++#define __NR_syscalls 452
+ 
+ /*
+  * 32 bit systems traditionally used different
+diff --git a/kernel/dma/direct.c b/kernel/dma/direct.c
+index 4c6c5e0635e3..54eb6384dfd0 100644
+--- a/kernel/dma/direct.c
++++ b/kernel/dma/direct.c
+@@ -222,6 +222,7 @@ void *dma_direct_alloc(struct device *dev, size_t size,
+ 			if (err)
+ 				goto out_free_pages;
+ 		}
++		//TODO use movdir64b or clear_page if ret and size are page-aligned
+ 		memset(ret, 0, size);
+ 		goto done;
+ 	}
+@@ -245,6 +246,7 @@ void *dma_direct_alloc(struct device *dev, size_t size,
+ 			goto out_free_pages;
+ 	}
+ 
++		//TODO use movdir64b or clear_page if ret and size are page-aligned
+ 	memset(ret, 0, size);
+ 
+ 	if (IS_ENABLED(CONFIG_ARCH_HAS_DMA_SET_UNCACHED) &&
+@@ -346,6 +348,7 @@ struct page *dma_direct_alloc_pages(struct device *dev, size_t size,
+ 				1 << get_order(size)))
+ 			goto out_free_pages;
+ 	}
++	//TODO use movdir64b or clear_page if ret and size are page-aligned
+ 	memset(ret, 0, size);
+ 	*dma_handle = phys_to_dma_direct(dev, page_to_phys(page));
+ 	return page;
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 38681ad44c76..ee1a31476fb7 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -365,6 +365,7 @@ struct vm_area_struct *vm_area_dup(struct vm_area_struct *orig)
+ 		 */
+ 		*new = data_race(*orig);
+ 		INIT_LIST_HEAD(&new->anon_vma_chain);
++		vma_get_encrypt_ref(new);
+ 		new->vm_next = new->vm_prev = NULL;
+ 	}
+ 	return new;
+@@ -372,6 +373,7 @@ struct vm_area_struct *vm_area_dup(struct vm_area_struct *orig)
+ 
+ void vm_area_free(struct vm_area_struct *vma)
+ {
++	vma_put_encrypt_ref(vma);
+ 	kmem_cache_free(vm_area_cachep, vma);
+ }
+ 
+diff --git a/kernel/sys_ni.c b/kernel/sys_ni.c
+index f43d89d92860..eb21b6a40c10 100644
+--- a/kernel/sys_ni.c
++++ b/kernel/sys_ni.c
+@@ -356,6 +356,9 @@ COND_SYSCALL(pkey_free);
+ 
+ /* memfd_secret */
+ COND_SYSCALL(memfd_secret);
++ 
++/* multi-key total memory encryption keys */
++COND_SYSCALL(encrypt_mprotect);
+ 
+ /*
+  * Architecture specific weak syscall entries.
+diff --git a/mm/compaction.c b/mm/compaction.c
+index bfc93da1c2c7..7dabf381203e 100644
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@ -1665,6 +1665,10 @@ static struct page *compaction_alloc(struct page *migratepage,
+ 	freepage = list_entry(cc->freepages.next, struct page, lru);
+ 	list_del(&freepage->lru);
+ 	cc->nr_freepages--;
++ 
++	/* Prepare the page using the same KeyID as the source page */
++	if (freepage)
++		prep_encrypted_page(freepage, 0, page_keyid(migratepage), false);
+ 
+ 	return freepage;
+ }
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index c5142d237e48..48ef752f0912 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -713,8 +713,7 @@ static void set_huge_zero_page(pgtable_t pgtable, struct mm_struct *mm,
+ 	pmd_t entry;
+ 	if (!pmd_none(*pmd))
+ 		return;
+-	entry = mk_pmd(zero_page, vma->vm_page_prot);
+-	entry = pmd_mkhuge(entry);
++	entry = mk_zero_pmd(zero_page, vma->vm_page_prot);
+ 	if (pgtable)
+ 		pgtable_trans_huge_deposit(mm, pmd, pgtable);
+ 	set_pmd_at(mm, haddr, pmd, entry);
+@@ -1944,8 +1943,7 @@ static void __split_huge_zero_page_pmd(struct vm_area_struct *vma,
+ 
+ 	for (i = 0; i < HPAGE_PMD_NR; i++, haddr += PAGE_SIZE) {
+ 		pte_t *pte, entry;
+-		entry = pfn_pte(my_zero_pfn(haddr), vma->vm_page_prot);
+-		entry = pte_mkspecial(entry);
++		entry = mk_zero_pte(haddr, vma->vm_page_prot);
+ 		pte = pte_offset_map(&_pmd, haddr);
+ 		VM_BUG_ON(!pte_none(*pte));
+ 		set_pte_at(mm, haddr, pte, entry);
+diff --git a/mm/khugepaged.c b/mm/khugepaged.c
+index 8a8b3aa92937..6ffb73d2cc3b 100644
+--- a/mm/khugepaged.c
++++ b/mm/khugepaged.c
+@@ -1181,6 +1181,17 @@ static void collapse_huge_page(struct mm_struct *mm,
+ 	 * can't run anymore.
+ 	 */
+ 	anon_vma_unlock_write(vma->anon_vma);
++ 
++	/*
++	 * At this point new_page is allocated as non-encrypted.
++	 * If VMA's KeyID is non-zero, we need to prepare it to be encrypted
++	 * before coping data.
++	 */
++	if (vma_keyid(vma)) {
++		prep_encrypted_page(new_page, HPAGE_PMD_ORDER,
++				vma_keyid(vma), false);
++	}
++
+ 
+ 	__collapse_huge_page_copy(pte, new_page, vma, address, pte_ptl,
+ 			&compound_pagelist);
+diff --git a/mm/ksm.c b/mm/ksm.c
+index a5716fdec1aa..d8b968896f68 100644
+--- a/mm/ksm.c
++++ b/mm/ksm.c
+@@ -1205,6 +1205,24 @@ static int try_to_merge_one_page(struct vm_area_struct *vma,
+ 	if (!PageAnon(page))
+ 		goto out;
+ 
++	/*
++	 * KeyID indicates what key to use to encrypt and decrypt page's
++	 * content.
++	 *
++	 * KSM compares plain text instead (transparently to KSM code).
++	 *
++	 * But we still need to make sure that pages with identical plain
++	 * text will not be merged together if they are encrypted with
++	 * different keys.
++	 *
++	 * To make it work kernel only allows merging pages with the same KeyID.
++	 * The approach guarantees that the merged page can be read by all
++	 * users.
++	 */
++	if (kpage && page_keyid(page) != page_keyid(kpage))
++		goto out;
++
++
+ 	/*
+ 	 * We need the page lock to read a stable PageSwapCache in
+ 	 * write_protect_page().  We use trylock_page() instead of
+diff --git a/mm/madvise.c b/mm/madvise.c
+index 0734db8d53a7..b40f16ce1ffc 100644
+--- a/mm/madvise.c
++++ b/mm/madvise.c
+@@ -138,7 +138,7 @@ static long madvise_behavior(struct vm_area_struct *vma,
+ 	pgoff = vma->vm_pgoff + ((start - vma->vm_start) >> PAGE_SHIFT);
+ 	*prev = vma_merge(mm, *prev, start, end, new_flags, vma->anon_vma,
+ 			  vma->vm_file, pgoff, vma_policy(vma),
+-			  vma->vm_userfaultfd_ctx);
++			  vma->vm_userfaultfd_ctx, vma_keyid(vma));
+ 	if (*prev) {
+ 		vma = *prev;
+ 		goto success;
+diff --git a/mm/memory-failure.c b/mm/memory-failure.c
+index bdbbb32211a5..389bf5870428 100644
+--- a/mm/memory-failure.c
++++ b/mm/memory-failure.c
+@@ -1615,13 +1615,18 @@ int memory_failure(unsigned long pfn, int flags)
+ 	bool retry = true;
+ 	static DEFINE_MUTEX(mf_mutex);
+ 
++	pr_warn("memory_failure: pfn %#lx flags %#lx (MF_ACTION_REQUIRED = %d)\n", pfn, flags, !!(flags & MF_ACTION_REQUIRED));
++
+ 	if (!sysctl_memory_failure_recovery)
+ 		panic("Memory failure on page %lx", pfn);
+ 
+ 	p = pfn_to_online_page(pfn);
++	pr_warn("memory_failure: p = %#lx\n", p);
+ 	if (!p) {
+ 		if (pfn_valid(pfn)) {
++			pr_warn("memory_failure: pfn_valid\n");
+ 			pgmap = get_dev_pagemap(pfn, NULL);
++			pr_warn("memory_failure: pgmap = %#lx\n", pgmap);
+ 			if (pgmap)
+ 				return memory_failure_dev_pagemap(pfn, flags,
+ 								  pgmap);
+@@ -1639,6 +1644,12 @@ int memory_failure(unsigned long pfn, int flags)
+ 		goto unlock_mutex;
+ 	}
+ 
++	if(0){
++		pr_warn("memory_failure: instead of TestSetPageHWPoison and checking flags we just always kill accessing process\n", p);
++		res = kill_accessing_process(current, pfn, flags);
++		goto unlock_mutex;
++	}
++
+ 	if (TestSetPageHWPoison(p)) {
+ 		pr_err("Memory failure: %#lx: already hardware poisoned\n",
+ 			pfn);
+diff --git a/mm/memory.c b/mm/memory.c
+index c52be6d6b605..e8dc55b58801 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -1655,6 +1655,23 @@ void zap_page_range(struct vm_area_struct *vma, unsigned long start,
+ 	mmu_notifier_invalidate_range_end(&range);
+ 	tlb_finish_mmu(&tlb);
+ }
++void not_quite_zap_page_range(struct vm_area_struct *vma, unsigned long start,
++		unsigned long size)
++{
++	struct mmu_notifier_range range;
++	struct mmu_gather tlb;
++
++	lru_add_drain();
++	mmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, vma, vma->vm_mm,
++				start, start + size);
++	tlb_gather_mmu(&tlb, vma->vm_mm);
++	update_hiwater_rss(vma->vm_mm);
++	mmu_notifier_invalidate_range_start(&range);
++	// for ( ; vma && vma->vm_start < range.end; vma = vma->vm_next)
++	// 	unmap_single_vma(&tlb, vma, start, range.end, NULL);
++	mmu_notifier_invalidate_range_end(&range);
++	tlb_finish_mmu(&tlb);
++}
+ 
+ /**
+  * zap_page_range_single - remove user pages in a given range
+@@ -3743,8 +3760,7 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+ 	/* Use the zero-page for reads */
+ 	if (!(vmf->flags & FAULT_FLAG_WRITE) &&
+ 			!mm_forbids_zeropage(vma->vm_mm)) {
+-		entry = pte_mkspecial(pfn_pte(my_zero_pfn(vmf->address),
+-						vma->vm_page_prot));
++		entry = mk_zero_pte(vmf->address, vma->vm_page_prot);
+ 		vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd,
+ 				vmf->address, &vmf->ptl);
+ 		if (!pte_none(*vmf->pte)) {
+diff --git a/mm/mempolicy.c b/mm/mempolicy.c
+index d12e0608fced..8ade4cd5baef 100644
+--- a/mm/mempolicy.c
++++ b/mm/mempolicy.c
+@@ -810,7 +810,7 @@ static int mbind_range(struct mm_struct *mm, unsigned long start,
+ 			((vmstart - vma->vm_start) >> PAGE_SHIFT);
+ 		prev = vma_merge(mm, prev, vmstart, vmend, vma->vm_flags,
+ 				 vma->anon_vma, vma->vm_file, pgoff,
+-				 new_pol, vma->vm_userfaultfd_ctx);
++				 new_pol, vma->vm_userfaultfd_ctx, vma_keyid(vma));
+ 		if (prev) {
+ 			vma = prev;
+ 			next = vma->vm_next;
+@@ -1196,6 +1196,7 @@ int do_migrate_pages(struct mm_struct *mm, const nodemask_t *from,
+  */
+ static struct page *new_page(struct page *page, unsigned long start)
+ {
++	//TODO does this function need treatment similar to alloc_migration_target?
+ 	struct vm_area_struct *vma;
+ 	unsigned long address;
+ 
+@@ -1208,11 +1209,17 @@ static struct page *new_page(struct page *page, unsigned long start)
+ 	}
+ 
+ 	if (PageHuge(page)) {
++		/*
++		 * HugeTLB doesn't support encryption. We shouldn't see
++		 * such pages.
++		 */
++		if (WARN_ON_ONCE(page_keyid(page)))
++			return NULL;
+ 		return alloc_huge_page_vma(page_hstate(compound_head(page)),
+ 				vma, address);
+ 	} else if (PageTransHuge(page)) {
++		//TODO does this need a keyid?
+ 		struct page *thp;
+-
+ 		thp = alloc_hugepage_vma(GFP_TRANSHUGE, vma, address,
+ 					 HPAGE_PMD_ORDER);
+ 		if (!thp)
+@@ -1223,8 +1230,9 @@ static struct page *new_page(struct page *page, unsigned long start)
+ 	/*
+ 	 * if !vma, alloc_page_vma() will use task or system default policy
+ 	 */
+-	return alloc_page_vma(GFP_HIGHUSER_MOVABLE | __GFP_RETRY_MAYFAIL,
+-			vma, address);
++	return alloc_pages_vma_keyid(GFP_HIGHUSER_MOVABLE | __GFP_RETRY_MAYFAIL, 0,
++			vma, address, numa_node_id(), false, page_keyid(page));
++
+ }
+ #else
+ 
+@@ -2083,12 +2091,22 @@ static struct page *alloc_pages_preferred_many(gfp_t gfp, unsigned int order,
+  * Return: The page on success or NULL if allocation fails.
+  */
+ struct page *alloc_pages_vma(gfp_t gfp, int order, struct vm_area_struct *vma,
+-		unsigned long addr, int node, bool hugepage)
++		unsigned long addr, int node, bool hugepage){
++	return alloc_pages_vma_keyid(gfp, order, vma, addr, node, hugepage, -1);
++}
++struct page *alloc_pages_vma_keyid(gfp_t gfp, int order, struct vm_area_struct *vma,
++		unsigned long addr, int node, bool hugepage, int keyid)
+ {
+ 	struct mempolicy *pol;
+ 	struct page *page;
+ 	int preferred_nid;
+ 	nodemask_t *nmask;
++	bool deferred_zero;
++ 
++ 	if(keyid == -1){
++		keyid = vma_keyid(vma);
++	}
++	deferred_zero = deferred_page_zero(keyid, &gfp);
+ 
+ 	pol = get_vma_policy(vma, addr);
+ 
+@@ -2152,6 +2170,8 @@ struct page *alloc_pages_vma(gfp_t gfp, int order, struct vm_area_struct *vma,
+ 	page = __alloc_pages(gfp, order, preferred_nid, nmask);
+ 	mpol_cond_put(pol);
+ out:
++	if (page)
++		prep_encrypted_page(page, order, keyid, deferred_zero);
+ 	return page;
+ }
+ EXPORT_SYMBOL(alloc_pages_vma);
+diff --git a/mm/migrate.c b/mm/migrate.c
+index 1852d787e6ab..cb02ce7f5eff 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -1618,6 +1618,14 @@ struct page *alloc_migration_target(struct page *page, unsigned long private)
+ 		nid = page_to_nid(page);
+ 
+ 	if (PageHuge(page)) {
++		//TODO
++		/*
++		 * HugeTLB doesn't support encryption. We shouldn't see
++		 * such pages.
++		 */
++		if (WARN_ON_ONCE(page_keyid(page)))
++			return NULL;
++
+ 		struct hstate *h = page_hstate(compound_head(page));
+ 
+ 		gfp_mask = htlb_modify_alloc_mask(h, gfp_mask);
+@@ -1637,7 +1645,8 @@ struct page *alloc_migration_target(struct page *page, unsigned long private)
+ 	if (is_highmem_idx(zidx) || zidx == ZONE_MOVABLE)
+ 		gfp_mask |= __GFP_HIGHMEM;
+ 
+-	new_page = __alloc_pages(gfp_mask, order, nid, mtc->nmask);
++	/* Allocate a page with the same KeyID as the source page */
++	new_page = __alloc_pages_keyid(gfp_mask, order, nid, mtc->nmask, page_keyid(page));
+ 
+ 	if (new_page && PageTransHuge(new_page))
+ 		prep_transhuge_page(new_page);
+@@ -2080,7 +2089,7 @@ static struct page *alloc_misplaced_dst_page(struct page *page,
+ 	int nid = (int) data;
+ 	struct page *newpage;
+ 
+-	newpage = __alloc_pages_node(nid,
++	newpage = __alloc_pages_node_keyid(nid, page_keyid(page),
+ 					 (GFP_HIGHUSER_MOVABLE |
+ 					  __GFP_THISNODE | __GFP_NOMEMALLOC |
+ 					  __GFP_NORETRY | __GFP_NOWARN) &
+@@ -2095,7 +2104,7 @@ static struct page *alloc_misplaced_dst_page_thp(struct page *page,
+ 	int nid = (int) data;
+ 	struct page *newpage;
+ 
+-	newpage = alloc_pages_node(nid, (GFP_TRANSHUGE_LIGHT | __GFP_THISNODE),
++	newpage = __alloc_pages_node_keyid(nid, page_keyid(page), (GFP_TRANSHUGE_LIGHT | __GFP_THISNODE),
+ 				   HPAGE_PMD_ORDER);
+ 	if (!newpage)
+ 		goto out;
+diff --git a/mm/mlock.c b/mm/mlock.c
+index 16d2ee160d43..e1bf531eee1e 100644
+--- a/mm/mlock.c
++++ b/mm/mlock.c
+@@ -511,7 +511,7 @@ static int mlock_fixup(struct vm_area_struct *vma, struct vm_area_struct **prev,
+ 	pgoff = vma->vm_pgoff + ((start - vma->vm_start) >> PAGE_SHIFT);
+ 	*prev = vma_merge(mm, *prev, start, end, newflags, vma->anon_vma,
+ 			  vma->vm_file, pgoff, vma_policy(vma),
+-			  vma->vm_userfaultfd_ctx);
++			  vma->vm_userfaultfd_ctx, vma_keyid(vma));
+ 	if (*prev) {
+ 		vma = *prev;
+ 		goto success;
+diff --git a/mm/mmap.c b/mm/mmap.c
+index 88dcc5c25225..111011bda244 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -1029,7 +1029,7 @@ int __vma_adjust(struct vm_area_struct *vma, unsigned long start,
+  */
+ static inline int is_mergeable_vma(struct vm_area_struct *vma,
+ 				struct file *file, unsigned long vm_flags,
+-				struct vm_userfaultfd_ctx vm_userfaultfd_ctx)
++				struct vm_userfaultfd_ctx vm_userfaultfd_ctx, int keyid)
+ {
+ 	/*
+ 	 * VM_SOFTDIRTY should not prevent from VMA merging, if we
+@@ -1043,6 +1043,8 @@ static inline int is_mergeable_vma(struct vm_area_struct *vma,
+ 		return 0;
+ 	if (vma->vm_file != file)
+ 		return 0;
++	if (vma_keyid(vma) != keyid)
++		return 0;
+ 	if (vma->vm_ops && vma->vm_ops->close)
+ 		return 0;
+ 	if (!is_mergeable_vm_userfaultfd_ctx(vma, vm_userfaultfd_ctx))
+@@ -1079,9 +1081,9 @@ static int
+ can_vma_merge_before(struct vm_area_struct *vma, unsigned long vm_flags,
+ 		     struct anon_vma *anon_vma, struct file *file,
+ 		     pgoff_t vm_pgoff,
+-		     struct vm_userfaultfd_ctx vm_userfaultfd_ctx)
++		     struct vm_userfaultfd_ctx vm_userfaultfd_ctx, int keyid)
+ {
+-	if (is_mergeable_vma(vma, file, vm_flags, vm_userfaultfd_ctx) &&
++	if (is_mergeable_vma(vma, file, vm_flags, vm_userfaultfd_ctx, keyid) &&
+ 	    is_mergeable_anon_vma(anon_vma, vma->anon_vma, vma)) {
+ 		if (vma->vm_pgoff == vm_pgoff)
+ 			return 1;
+@@ -1100,9 +1102,9 @@ static int
+ can_vma_merge_after(struct vm_area_struct *vma, unsigned long vm_flags,
+ 		    struct anon_vma *anon_vma, struct file *file,
+ 		    pgoff_t vm_pgoff,
+-		    struct vm_userfaultfd_ctx vm_userfaultfd_ctx)
++		    struct vm_userfaultfd_ctx vm_userfaultfd_ctx, int keyid)
+ {
+-	if (is_mergeable_vma(vma, file, vm_flags, vm_userfaultfd_ctx) &&
++	if (is_mergeable_vma(vma, file, vm_flags, vm_userfaultfd_ctx, keyid) &&
+ 	    is_mergeable_anon_vma(anon_vma, vma->anon_vma, vma)) {
+ 		pgoff_t vm_pglen;
+ 		vm_pglen = vma_pages(vma);
+@@ -1160,7 +1162,7 @@ struct vm_area_struct *vma_merge(struct mm_struct *mm,
+ 			unsigned long end, unsigned long vm_flags,
+ 			struct anon_vma *anon_vma, struct file *file,
+ 			pgoff_t pgoff, struct mempolicy *policy,
+-			struct vm_userfaultfd_ctx vm_userfaultfd_ctx)
++			struct vm_userfaultfd_ctx vm_userfaultfd_ctx, int keyid)
+ {
+ 	pgoff_t pglen = (end - addr) >> PAGE_SHIFT;
+ 	struct vm_area_struct *area, *next;
+@@ -1190,7 +1192,7 @@ struct vm_area_struct *vma_merge(struct mm_struct *mm,
+ 			mpol_equal(vma_policy(prev), policy) &&
+ 			can_vma_merge_after(prev, vm_flags,
+ 					    anon_vma, file, pgoff,
+-					    vm_userfaultfd_ctx)) {
++					    vm_userfaultfd_ctx, keyid)) {
+ 		/*
+ 		 * OK, it can.  Can we now merge in the successor as well?
+ 		 */
+@@ -1199,7 +1201,7 @@ struct vm_area_struct *vma_merge(struct mm_struct *mm,
+ 				can_vma_merge_before(next, vm_flags,
+ 						     anon_vma, file,
+ 						     pgoff+pglen,
+-						     vm_userfaultfd_ctx) &&
++						     vm_userfaultfd_ctx, keyid) &&
+ 				is_mergeable_anon_vma(prev->anon_vma,
+ 						      next->anon_vma, NULL)) {
+ 							/* cases 1, 6 */
+@@ -1222,7 +1224,7 @@ struct vm_area_struct *vma_merge(struct mm_struct *mm,
+ 			mpol_equal(policy, vma_policy(next)) &&
+ 			can_vma_merge_before(next, vm_flags,
+ 					     anon_vma, file, pgoff+pglen,
+-					     vm_userfaultfd_ctx)) {
++					     vm_userfaultfd_ctx, keyid)) {
+ 		if (prev && addr < prev->vm_end)	/* case 4 */
+ 			err = __vma_adjust(prev, prev->vm_start,
+ 					 addr, prev->vm_pgoff, NULL, next);
+@@ -1755,7 +1757,7 @@ unsigned long mmap_region(struct file *file, unsigned long addr,
+ 	 * Can we just expand an old mapping?
+ 	 */
+ 	vma = vma_merge(mm, prev, addr, addr + len, vm_flags,
+-			NULL, file, pgoff, NULL, NULL_VM_UFFD_CTX);
++			NULL, file, pgoff, NULL, NULL_VM_UFFD_CTX, 0);
+ 	if (vma)
+ 		goto out;
+ 
+@@ -1804,7 +1806,7 @@ unsigned long mmap_region(struct file *file, unsigned long addr,
+ 		 */
+ 		if (unlikely(vm_flags != vma->vm_flags && prev)) {
+ 			merge = vma_merge(mm, prev, vma->vm_start, vma->vm_end, vma->vm_flags,
+-				NULL, vma->vm_file, vma->vm_pgoff, NULL, NULL_VM_UFFD_CTX);
++				NULL, vma->vm_file, vma->vm_pgoff, NULL, NULL_VM_UFFD_CTX, 0);
+ 			if (merge) {
+ 				/* ->mmap() can change vma->vm_file and fput the original file. So
+ 				 * fput the vma->vm_file here or we would add an extra fput for file
+@@ -3057,7 +3059,7 @@ static int do_brk_flags(unsigned long addr, unsigned long len, unsigned long fla
+ 
+ 	/* Can we just expand an old private anonymous mapping? */
+ 	vma = vma_merge(mm, prev, addr, addr + len, flags,
+-			NULL, NULL, pgoff, NULL, NULL_VM_UFFD_CTX);
++			NULL, NULL, pgoff, NULL, NULL_VM_UFFD_CTX, 0);
+ 	if (vma)
+ 		goto out;
+ 
+@@ -3250,7 +3252,7 @@ struct vm_area_struct *copy_vma(struct vm_area_struct **vmap,
+ 		return NULL;	/* should never get here */
+ 	new_vma = vma_merge(mm, prev, addr, addr + len, vma->vm_flags,
+ 			    vma->anon_vma, vma->vm_file, pgoff, vma_policy(vma),
+-			    vma->vm_userfaultfd_ctx);
++			    vma->vm_userfaultfd_ctx, vma_keyid(vma));
+ 	if (new_vma) {
+ 		/*
+ 		 * Source vma may have been merged into new_vma
+diff --git a/mm/mprotect.c b/mm/mprotect.c
+index 883e2cc85cad..b88b6a6f0b0d 100644
+--- a/mm/mprotect.c
++++ b/mm/mprotect.c
+@@ -28,6 +28,7 @@
+ #include <linux/ksm.h>
+ #include <linux/uaccess.h>
+ #include <linux/mm_inline.h>
++#include <linux/key.h>
+ #include <linux/pgtable.h>
+ #include <asm/cacheflush.h>
+ #include <asm/mmu_context.h>
+@@ -35,6 +36,8 @@
+ 
+ #include "internal.h"
+ 
++#define NO_KEY	-1
++
+ static unsigned long change_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
+ 		unsigned long addr, unsigned long end, pgprot_t newprot,
+ 		unsigned long cp_flags)
+@@ -404,10 +407,32 @@ static const struct mm_walk_ops prot_none_walk_ops = {
+ 	.hugetlb_entry		= prot_none_hugetlb_entry,
+ 	.test_walk		= prot_none_test,
+ };
++ 
++/*
++ * Encrypted mprotect is only supported on anonymous mappings.
++ * If this test fails on any single VMA, the entire mprotect
++ * request fails.
++ */
++static bool mem_supports_encryption(struct vm_area_struct *vma, unsigned long end)
++{
++	struct vm_area_struct *test_vma = vma;
++
++	do {
++		if (!vma_is_anonymous(test_vma)){
++			// return false;
++			// pr_info("MKTME: TESTING: vma is not anonymous (vma = %#llx). Ignoring.", test_vma->vm_start);
++		}
++
++		test_vma = test_vma->vm_next;
++	} while (test_vma && test_vma->vm_start < end);
++	return true;
++}
++
+ 
+ int
+ mprotect_fixup(struct vm_area_struct *vma, struct vm_area_struct **pprev,
+-	unsigned long start, unsigned long end, unsigned long newflags)
++	unsigned long start, unsigned long end, unsigned long newflags, 
++	int newkeyid, unsigned long mprotect_fixup_flags)
+ {
+ 	struct mm_struct *mm = vma->vm_mm;
+ 	unsigned long oldflags = vma->vm_flags;
+@@ -417,7 +442,7 @@ mprotect_fixup(struct vm_area_struct *vma, struct vm_area_struct **pprev,
+ 	int error;
+ 	int dirty_accountable = 0;
+ 
+-	if (newflags == oldflags) {
++	if (newflags == oldflags && (newkeyid == vma_keyid(vma) || newkeyid == NO_KEY)) {
+ 		*pprev = vma;
+ 		return 0;
+ 	}
+@@ -464,7 +489,7 @@ mprotect_fixup(struct vm_area_struct *vma, struct vm_area_struct **pprev,
+ 	pgoff = vma->vm_pgoff + ((start - vma->vm_start) >> PAGE_SHIFT);
+ 	*pprev = vma_merge(mm, *pprev, start, end, newflags,
+ 			   vma->anon_vma, vma->vm_file, pgoff, vma_policy(vma),
+-			   vma->vm_userfaultfd_ctx);
++			   vma->vm_userfaultfd_ctx, vma_keyid(vma));
+ 	if (*pprev) {
+ 		vma = *pprev;
+ 		VM_WARN_ON((vma->vm_flags ^ newflags) & ~VM_SOFTDIRTY);
+@@ -475,17 +500,24 @@ mprotect_fixup(struct vm_area_struct *vma, struct vm_area_struct **pprev,
+ 
+ 	if (start != vma->vm_start) {
+ 		error = split_vma(mm, vma, start, 1);
+-		if (error)
++		if (error){
++			pr_info("mprotect_fixup vm_start split_vma failed.");
+ 			goto fail;
++		}
+ 	}
+ 
+ 	if (end != vma->vm_end) {
+ 		error = split_vma(mm, vma, end, 0);
+-		if (error)
++		if (error){
++			pr_info("mprotect_fixup vm_end split_vma failed.");
+ 			goto fail;
++		}
+ 	}
+ 
+ success:
++	if (newkeyid != NO_KEY){
++		mprotect_set_encrypt(vma, newkeyid, start, end, mprotect_fixup_flags);
++	}
+ 	/*
+ 	 * vm_flags and vm_page_prot are protected by the mmap_lock
+ 	 * held in write mode.
+@@ -517,10 +549,15 @@ mprotect_fixup(struct vm_area_struct *vma, struct vm_area_struct **pprev,
+ }
+ 
+ /*
+- * pkey==-1 when doing a legacy mprotect()
++ * do_mprotect_ext() supports the legacy mprotect behavior plus extensions
++ * for Protection Keys and Memory Encryption Keys. These extensions are
++ * mutually exclusive and the behavior is:
++ *	(pkey==NO_KEY && keyid==NO_KEY) ==> legacy mprotect
++ *	(pkey is valid)  ==> legacy mprotect plus Protection Key extensions
++ *	(keyid is valid) ==> legacy mprotect plus Encryption Key extensions
+  */
+-static int do_mprotect_pkey(unsigned long start, size_t len,
+-		unsigned long prot, int pkey)
++static int do_mprotect_ext(unsigned long start, size_t len,
++		unsigned long prot, int pkey, int keyid)
+ {
+ 	unsigned long nstart, end, tmp, reqprot;
+ 	struct vm_area_struct *vma, *prev;
+@@ -581,6 +618,12 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
+ 				goto out;
+ 		}
+ 	}
++
++	if (keyid > 0 && !mem_supports_encryption(vma, end)) {
++		error = -EINVAL;
++		goto out;
++	}
++
+ 	if (start > vma->vm_start)
+ 		prev = vma;
+ 
+@@ -633,7 +676,7 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
+ 				goto out;
+ 		}
+ 
+-		error = mprotect_fixup(vma, &prev, nstart, tmp, newflags);
++		error = mprotect_fixup(vma, &prev, nstart, tmp, newflags, keyid, prot & (PROT_TODO));
+ 		if (error)
+ 			goto out;
+ 
+@@ -659,7 +702,7 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
+ SYSCALL_DEFINE3(mprotect, unsigned long, start, size_t, len,
+ 		unsigned long, prot)
+ {
+-	return do_mprotect_pkey(start, len, prot, -1);
++	return do_mprotect_ext(start, len, prot, -1, NO_KEY);
+ }
+ 
+ #ifdef CONFIG_ARCH_HAS_PKEYS
+@@ -667,7 +710,7 @@ SYSCALL_DEFINE3(mprotect, unsigned long, start, size_t, len,
+ SYSCALL_DEFINE4(pkey_mprotect, unsigned long, start, size_t, len,
+ 		unsigned long, prot, int, pkey)
+ {
+-	return do_mprotect_pkey(start, len, prot, pkey);
++	return do_mprotect_ext(start, len, prot, pkey, NO_KEY);
+ }
+ 
+ SYSCALL_DEFINE2(pkey_alloc, unsigned long, flags, unsigned long, init_val)
+@@ -716,3 +759,43 @@ SYSCALL_DEFINE1(pkey_free, int, pkey)
+ }
+ 
+ #endif /* CONFIG_ARCH_HAS_PKEYS */
++
++#ifdef CONFIG_X86_INTEL_MKTME
++
++extern int mktme_keyid_from_key(struct key *key);
++
++SYSCALL_DEFINE4(encrypt_mprotect, unsigned long, start, size_t, len,
++		unsigned long, prot, key_serial_t, serial)
++{
++	key_ref_t key_ref;
++	struct key *key;
++	int ret, keyid;
++
++	/* MKTME restriction */
++	if (!PAGE_ALIGNED(len))
++		return -EINVAL;
++
++	/*
++	 * key_ref prevents the destruction of the key
++	 * while the memory encryption is being set up.
++	 */
++
++	key_ref = lookup_user_key(serial, 0, KEY_NEED_VIEW);
++	if (IS_ERR(key_ref)){
++		pr_info("encrypt_mprotect lookup_user_key failed key_ref = %p", (void*)key_ref);
++		return PTR_ERR(key_ref);
++	}
++
++	key = key_ref_to_ptr(key_ref);
++	keyid = mktme_keyid_from_key(key);
++	if (!keyid) {
++		pr_info("encrypt_mprotect mktme_keyid_from_key failed. key = %p", (void*)key);
++		key_ref_put(key_ref);
++		return -EINVAL;
++	}
++	ret = do_mprotect_ext(start, len, prot, NO_KEY, keyid);
++	key_ref_put(key_ref);
++	return ret;
++}
++
++#endif /* CONFIG_X86_INTEL_MKTME */
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 23d3339ac4e8..d07b4b54c660 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -4516,6 +4516,54 @@ should_compact_retry(struct alloc_context *ac, unsigned int order, int alloc_fla
+ }
+ #endif /* CONFIG_COMPACTION */
+ 
++#ifndef CONFIG_NUMA
++struct page *alloc_pages_vma(gfp_t gfp_mask, int order,
++		struct vm_area_struct *vma, unsigned long addr,
++		int node)
++{
++	struct page *page;
++	bool deferred_zero;
++	int keyid = vma_keyid(vma);
++
++	deferred_zero = deferred_page_zero(keyid, &gfp_mask);
++	page = alloc_pages(gfp_mask, order);
++	if (page)
++		prep_encrypted_page(page, order, keyid, deferred_zero);
++
++	return page;
++}
++#endif
++
++/**
++ * __alloc_pages_node_keyid - allocate a page for a specific KeyID with
++ * preferred allocation node.
++ * @nid: the preferred node ID where memory should be allocated
++ * @keyid: KeyID to use
++ * @gfp_mask: GFP flags for the allocation
++ * @order: the page order
++ *
++ * Like __alloc_pages_node(), but prepares the page for a specific KeyID.
++ *
++ * Return: pointer to the allocated page or %NULL in case of error.
++ */
++struct page * __alloc_pages_node_keyid(int nid, int keyid,
++		gfp_t gfp_mask, unsigned int order)
++{
++	struct page *page;
++	bool deferred_zero;
++
++	VM_BUG_ON(nid < 0 || nid >= MAX_NUMNODES);
++	VM_WARN_ON(!node_online(nid));
++
++	deferred_zero = deferred_page_zero(keyid, &gfp_mask);
++	page = __alloc_pages(gfp_mask, order, nid, NULL);
++
++	if (page)
++		prep_encrypted_page(page, order, keyid, deferred_zero);
++
++	return page;
++}
++
+ #ifdef CONFIG_LOCKDEP
+ static struct lockdep_map __fs_reclaim_map =
+ 	STATIC_LOCKDEP_MAP_INIT("fs_reclaim", &__fs_reclaim_map);
+@@ -5405,6 +5453,34 @@ struct page *__alloc_pages(gfp_t gfp, unsigned int order, int preferred_nid,
+ 	return page;
+ }
+ EXPORT_SYMBOL(__alloc_pages);
++ 
++/**
++ * __alloc_pages_keyid - allocate a page for a specific KeyID.
++ * @gfp_mask: GFP flags for the allocation
++ * @order: the page order
++ * @preferred_nid: the preferred node ID where memory should be allocated
++ * @nodemask: allowed nodemask
++ * @keyid: KeyID to use
++ *
++ * Like __alloc_pages(), but prepares the page for a specific KeyID.
++ *
++ * Return: pointer to the allocated page or %NULL in case of error.
++ */
++struct page *
++__alloc_pages_keyid(gfp_t gfp_mask, unsigned int order,
++		int preferred_nid, nodemask_t *nodemask, int keyid)
++{
++	struct page *page;
++	bool deferred_zero;
++
++	deferred_zero = deferred_page_zero(keyid, &gfp_mask);
++	page = __alloc_pages(gfp_mask, order, preferred_nid, nodemask);
++	if (page)
++		prep_encrypted_page(page, order, keyid, deferred_zero);
++	return page;
++}
++EXPORT_SYMBOL(__alloc_pages_keyid);
++
+ 
+ /*
+  * Common helper functions. Never use with __GFP_HIGHMEM because the returned
+diff --git a/mm/page_ext.c b/mm/page_ext.c
+index 2a52fd9ed464..86613e2fa2fa 100644
+--- a/mm/page_ext.c
++++ b/mm/page_ext.c
+@@ -75,6 +75,9 @@ static struct page_ext_operations *page_ext_ops[] = {
+ #if defined(CONFIG_PAGE_IDLE_FLAG) && !defined(CONFIG_64BIT)
+ 	&page_idle_ops,
+ #endif
++#ifdef CONFIG_X86_INTEL_MKTME
++	&page_mktme_ops,
++#endif
+ };
+ 
+ unsigned long page_ext_size = sizeof(struct page_ext);
+@@ -148,6 +151,7 @@ struct page_ext *lookup_page_ext(const struct page *page)
+ 					MAX_ORDER_NR_PAGES);
+ 	return get_entry(base, index);
+ }
++EXPORT_SYMBOL_GPL(lookup_page_ext);
+ 
+ static int __init alloc_node_page_ext(int nid)
+ {
+@@ -217,6 +221,7 @@ struct page_ext *lookup_page_ext(const struct page *page)
+ 		return NULL;
+ 	return get_entry(section->page_ext, pfn);
+ }
++EXPORT_SYMBOL_GPL(lookup_page_ext);
+ 
+ static void *__meminit alloc_page_ext(size_t size, int nid)
+ {
+diff --git a/mm/userfaultfd.c b/mm/userfaultfd.c
+index 7a9008415534..3f3aaef23b8d 100644
+--- a/mm/userfaultfd.c
++++ b/mm/userfaultfd.c
+@@ -189,8 +189,7 @@ static int mfill_zeropage_pte(struct mm_struct *dst_mm,
+ 	pgoff_t offset, max_off;
+ 	struct inode *inode;
+ 
+-	_dst_pte = pte_mkspecial(pfn_pte(my_zero_pfn(dst_addr),
+-					 dst_vma->vm_page_prot));
++	_dst_pte = mk_zero_pte(dst_addr, dst_vma->vm_page_prot);
+ 	dst_pte = pte_offset_map_lock(dst_mm, dst_pmd, dst_addr, &ptl);
+ 	if (dst_vma->vm_file) {
+ 		/* the shmem MAP_PRIVATE case requires checking the i_size */
+diff --git a/security/keys/Makefile b/security/keys/Makefile
+index 5f40807f05b3..fc223f8850c0 100644
+--- a/security/keys/Makefile
++++ b/security/keys/Makefile
+@@ -30,3 +30,4 @@ obj-$(CONFIG_ASYMMETRIC_KEY_TYPE) += keyctl_pkey.o
+ obj-$(CONFIG_BIG_KEYS) += big_key.o
+ obj-$(CONFIG_TRUSTED_KEYS) += trusted-keys/
+ obj-$(CONFIG_ENCRYPTED_KEYS) += encrypted-keys/
++obj-$(CONFIG_X86_INTEL_MKTME) += mktme_keys.o
+diff --git a/security/keys/mktme_keys.c b/security/keys/mktme_keys.c
+new file mode 100644
+index 000000000000..022d6cb1f1b6
+--- /dev/null
++++ b/security/keys/mktme_keys.c
+@@ -0,0 +1,652 @@
++// SPDX-License-Identifier: GPL-3.0
++
++/* Documentation/x86/mktme/ */
++
++#include <linux/acpi.h>
++#include <linux/cred.h>
++#include <linux/cpu.h>
++#include <linux/init.h>
++#include <linux/key.h>
++#include <linux/key-type.h>
++#include <linux/memory.h>
++#include <linux/mm.h>
++#include <linux/parser.h>
++#include <linux/percpu-refcount.h>
++#include <linux/string.h>
++#include <asm/intel_pconfig.h>
++#include <keys/mktme-type.h>
++#include <keys/user-type.h>
++
++#include "internal.h"
++
++static DEFINE_SPINLOCK(mktme_lock);
++static unsigned int mktme_available_keyids;  /* Free Hardware KeyIDs */
++static struct kmem_cache *mktme_prog_cache;  /* Hardware programming cache */
++static unsigned long *mktme_target_map;	     /* PCONFIG programming target */
++static cpumask_var_t mktme_leadcpus;	     /* One CPU per PCONFIG target */
++static bool mktme_allow_keys;		     /* HW topology supports keys */
++
++enum mktme_keyid_state {
++	KEYID_AVAILABLE,	/* Available to be assigned */
++	KEYID_ASSIGNED,		/* Assigned to a userspace key */
++	KEYID_REF_KILLED,	/* Userspace key has been destroyed */
++	KEYID_REF_RELEASED,	/* Last reference is released */
++};
++
++/* 1:1 Mapping between Userspace Keys (struct key) and Hardware KeyIDs */
++struct mktme_mapping {
++	struct key		*key;
++	enum mktme_keyid_state	state;
++};
++
++static struct mktme_mapping *mktme_map;
++
++int mktme_reserve_keyid(struct key *key)
++{
++	int i;
++
++	if (!mktme_available_keyids)
++		return 0;
++
++	for (i = 1; i <= mktme_nr_keyids(); i++) {
++		if (mktme_map[i].state == KEYID_AVAILABLE) {
++			mktme_map[i].state = KEYID_ASSIGNED;
++			mktme_map[i].key = key;
++			mktme_available_keyids--;
++			return i;
++		}
++	}
++	return 0;
++}
++
++static void mktme_release_keyid(int keyid)
++{
++	 mktme_map[keyid].state = KEYID_AVAILABLE;
++	 mktme_available_keyids++;
++}
++
++int mktme_keyid_from_key(struct key *key)
++{
++	int i;
++
++	for (i = 1; i <= mktme_nr_keyids(); i++) {
++		if (mktme_map[i].key == key)
++			return i;
++	}
++	return 0;
++}
++
++static void mktme_clear_hardware_keyid(struct work_struct *work);
++static DECLARE_WORK(mktme_clear_work, mktme_clear_hardware_keyid);
++
++struct percpu_ref *encrypt_count;
++void mktme_percpu_ref_release(struct percpu_ref *ref)
++{
++	unsigned long flags;
++	int keyid;
++
++	for (keyid = 1; keyid <= mktme_nr_keyids(); keyid++) {
++		if (&encrypt_count[keyid] == ref)
++			break;
++	}
++	if (&encrypt_count[keyid] != ref) {
++		pr_debug("%s: invalid ref counter\n", __func__);
++		return;
++	}
++	percpu_ref_exit(ref);
++	spin_lock_irqsave(&mktme_lock, flags);
++	mktme_map[keyid].state = KEYID_REF_RELEASED;
++	spin_unlock_irqrestore(&mktme_lock, flags);
++	schedule_work(&mktme_clear_work);
++}
++
++enum mktme_opt_id {
++	OPT_ERROR,
++	OPT_TYPE,
++	OPT_ALGORITHM,
++};
++
++static const match_table_t mktme_token = {
++	{OPT_TYPE, "type=%s"},
++	{OPT_ALGORITHM, "algorithm=%s"},
++	{OPT_ERROR, NULL}
++};
++
++struct mktme_hw_program_info {
++	struct mktme_key_program *key_program;
++	int *status;
++};
++
++struct mktme_err_table {
++	const char *msg;
++	bool retry;
++};
++
++static const struct mktme_err_table mktme_error[] = {
++/* MKTME_PROG_SUCCESS     */ {"KeyID was successfully programmed",   false},
++/* MKTME_INVALID_PROG_CMD */ {"Invalid KeyID programming command",   false},
++/* MKTME_ENTROPY_ERROR    */ {"Insufficient entropy",		      true},
++/* MKTME_INVALID_KEYID    */ {"KeyID not valid",		     false},
++/* MKTME_INVALID_ENC_ALG  */ {"Invalid encryption algorithm chosen", false},
++/* MKTME_DEVICE_BUSY      */ {"Failure to access key table",	      true},
++};
++
++static int mktme_parse_program_status(int status[])
++{
++	int cpu, sum = 0;
++
++	/* Success: all CPU(s) programmed all key table(s) */
++	for_each_cpu(cpu, mktme_leadcpus)
++		sum += status[cpu];
++	if (!sum)
++		return MKTME_PROG_SUCCESS;
++
++	/* Invalid Parameters: log the error and return the error. */
++	for_each_cpu(cpu, mktme_leadcpus) {
++		switch (status[cpu]) {
++		case MKTME_INVALID_KEYID:
++		case MKTME_INVALID_PROG_CMD:
++		case MKTME_INVALID_ENC_ALG:
++			pr_err("mktme: %s\n", mktme_error[status[cpu]].msg);
++			return status[cpu];
++
++		default:
++			break;
++		}
++	}
++	/*
++	 * Device Busy or Insufficient Entropy: do not log the
++	 * error. These will be retried and if retries (time or
++	 * count runs out) caller will log the error.
++	 */
++	for_each_cpu(cpu, mktme_leadcpus) {
++		if (status[cpu] == MKTME_DEVICE_BUSY)
++			return status[cpu];
++	}
++	return MKTME_ENTROPY_ERROR;
++}
++
++/* Program a single key using one CPU. */
++static void mktme_do_program(void *hw_program_info)
++{
++	struct mktme_hw_program_info *info = hw_program_info;
++	int cpu;
++
++	cpu = smp_processor_id();
++	info->status[cpu] = mktme_key_program(info->key_program);
++}
++
++static int mktme_program_all_keytables(struct mktme_key_program *key_program)
++{
++	struct mktme_hw_program_info info;
++	int err, retries = 10; /* Maybe users should handle retries */
++
++	info.key_program = key_program;
++	info.status = kcalloc(num_possible_cpus(), sizeof(info.status[0]),
++			      GFP_KERNEL);
++
++	while (retries--) {
++		cpus_read_lock();
++		on_each_cpu_mask(mktme_leadcpus, mktme_do_program,
++				 &info, 1);
++		cpus_read_unlock();
++
++		err = mktme_parse_program_status(info.status);
++		if (!err)			   /* Success */
++			return err;
++		else if (!mktme_error[err].retry)  /* Error no retry */
++			return -ENOKEY;
++	}
++	/* Ran out of retries */
++	pr_err("mktme: %s\n", mktme_error[err].msg);
++	return err;
++}
++
++/* Copy the payload to the HW programming structure and program this KeyID */
++static int mktme_program_keyid(int keyid, u32 payload)
++{
++	struct mktme_key_program *kprog = NULL;
++	int ret;
++
++	kprog = kmem_cache_zalloc(mktme_prog_cache, GFP_KERNEL);
++	if (!kprog)
++		return -ENOMEM;
++
++	/* Hardware programming requires cached aligned struct */
++	kprog->keyid = keyid;
++	kprog->keyid_ctrl = payload;
++
++	if(payload & MKTME_KEYID_SET_KEY_DIRECT){
++		int key_size_byte = 16;
++		if(payload & (MKTME_ALG_AES_XTS_256 << PAYLOAD_ALG_SHIFT)){
++			key_size_byte = 32;
++		}
++		memset(kprog->key_field_1, 0,    64);
++		memset(kprog->key_field_2, 0,    64);
++		memset(kprog->key_field_1, 0x42, key_size_byte);
++		memset(kprog->key_field_2, 0x42, key_size_byte);
++	}
++
++	ret = mktme_program_all_keytables(kprog);
++	kmem_cache_free(mktme_prog_cache, kprog);
++	return ret;
++}
++
++static void mktme_clear_hardware_keyid(struct work_struct *work)
++{
++	u32 clear_payload = MKTME_KEYID_CLEAR_KEY;
++	unsigned long flags;
++	int keyid, ret;
++
++	for (keyid = 1; keyid <= mktme_nr_keyids(); keyid++) {
++		if (mktme_map[keyid].state != KEYID_REF_RELEASED)
++			continue;
++
++		ret = mktme_program_keyid(keyid, clear_payload);
++		if (ret != MKTME_PROG_SUCCESS)
++			pr_debug("mktme: clear key failed [%s]\n",
++				 mktme_error[ret].msg);
++
++		spin_lock_irqsave(&mktme_lock, flags);
++		mktme_release_keyid(keyid);
++		spin_unlock_irqrestore(&mktme_lock, flags);
++	}
++}
++
++/* Key Service Method called when a Userspace Key is garbage collected. */
++static void mktme_destroy_key(struct key *key)
++{
++	int keyid = mktme_keyid_from_key(key);
++	unsigned long flags;
++
++	spin_lock_irqsave(&mktme_lock, flags);
++	mktme_map[keyid].key = NULL;
++	mktme_map[keyid].state = KEYID_REF_KILLED;
++	spin_unlock_irqrestore(&mktme_lock, flags);
++	percpu_ref_kill(&encrypt_count[keyid]);
++}
++
++static void mktme_update_pconfig_targets(void);
++/* Key Service Method to create a new key. Payload is preparsed. */
++int mktme_instantiate_key(struct key *key, struct key_preparsed_payload *prep)
++{
++	u32 *payload = prep->payload.data[0];
++	unsigned long flags;
++	int ret = -ENOKEY;
++	int keyid;
++
++	spin_lock_irqsave(&mktme_lock, flags);
++
++	/* Topology supports key creation */
++	if (mktme_allow_keys)
++		goto get_key;
++
++	/* Topology unknown, check it. */
++	if (!mktme_hmat_evaluate()) {
++		ret = -EINVAL;
++		goto out_unlock;
++	}
++
++	/* Keys are now allowed. Update the programming targets. */
++	mktme_update_pconfig_targets();
++	mktme_allow_keys = true;
++
++get_key:
++	keyid = mktme_reserve_keyid(key);
++	spin_unlock_irqrestore(&mktme_lock, flags);
++	if (!keyid)
++		goto out;
++
++	if (percpu_ref_init(&encrypt_count[keyid], mktme_percpu_ref_release,
++			    0, GFP_KERNEL))
++		goto out_free_key;
++
++	ret = mktme_program_keyid(keyid, *payload);
++	if (ret == MKTME_PROG_SUCCESS)
++		goto out;
++
++	/* Key programming failed */
++	percpu_ref_exit(&encrypt_count[keyid]);
++
++out_free_key:
++	spin_lock_irqsave(&mktme_lock, flags);
++	mktme_release_keyid(keyid);
++out_unlock:
++	spin_unlock_irqrestore(&mktme_lock, flags);
++out:
++	return ret;
++}
++
++/* Make sure arguments are correct for the TYPE of key requested */
++static int mktme_check_options(u32 *payload, unsigned long token_mask,
++			       enum mktme_type type, enum mktme_alg alg)
++{
++	if (!token_mask){
++		pr_info("mktme_check_options Error. !token_mask\n");
++		return -EINVAL;
++	}
++
++	switch (type) {
++	case MKTME_TYPE_CPU:
++		if (test_bit(OPT_ALGORITHM, &token_mask))
++			*payload |= (1 << alg) << PAYLOAD_ALG_SHIFT;
++		else{
++			pr_info("mktme_check_options Error. test_bit(OPT_ALGORITHM, &token_mask) failed\n");
++			return -EINVAL;
++		}
++
++		*payload |= MKTME_KEYID_SET_KEY_RANDOM;
++		break;
++	case MKTME_TYPE_CLEAR:
++		if (test_bit(OPT_ALGORITHM, &token_mask))
++			*payload |= (1 << alg) << PAYLOAD_ALG_SHIFT;
++		else{
++			pr_info("mktme_check_options Error. test_bit(OPT_ALGORITHM, &token_mask) failed\n");
++			return -EINVAL;
++		}
++
++		*payload |= MKTME_KEYID_CLEAR_KEY;
++		break;
++	case MKTME_TYPE_DIRECT:
++		if (test_bit(OPT_ALGORITHM, &token_mask))
++			*payload |= (1 << alg) << PAYLOAD_ALG_SHIFT;
++		else{
++			pr_info("mktme_check_options Error. test_bit(OPT_ALGORITHM, &token_mask) failed\n");
++			return -EINVAL;
++		}
++		*payload |= MKTME_KEYID_SET_KEY_DIRECT;
++	case MKTME_TYPE_NO_ENCRYPT:
++		*payload |= MKTME_KEYID_NO_ENCRYPT;
++		break;
++
++	default:
++		pr_info("mktme_check_options Error. type == default\n");
++		return -EINVAL;
++	}
++	return 0;
++}
++
++/* Parse the options and store the key programming data in the payload. */
++static int mktme_get_options(char *options, u32 *payload)
++{
++	enum mktme_alg alg = MKTME_ALG_AES_XTS_128;
++	enum mktme_type type = MKTME_TYPE_ERROR;
++	substring_t args[MAX_OPT_ARGS];
++	unsigned long token_mask = 0;
++	char *p = options;
++	int token;
++
++	while ((p = strsep(&options, " \t"))) {
++		if (*p == '\0' || *p == ' ' || *p == '\t')
++			continue;
++		token = match_token(p, mktme_token, args);
++		if (token == OPT_ERROR){
++			pr_info("mktme_get_options Error. token == OPT_ERROR. options = %s\n", options);
++			return -EINVAL;
++		}
++		if (test_and_set_bit(token, &token_mask)){
++			pr_info("mktme_get_options Error. test_and_set_bit(token, &token_mask). options = %s\n", options);
++			return -EINVAL;
++		}
++
++		switch (token) {
++		case OPT_TYPE:
++			type = match_string(mktme_type_names,
++					    ARRAY_SIZE(mktme_type_names),
++					    args[0].from);
++			if (type < 0){
++				pr_info("mktme_get_options Error. type not supported (match_string). options = %s\n", options);
++				return -EINVAL;
++			}
++			break;
++
++		case OPT_ALGORITHM:
++			/* Algorithm must be generally supported */
++			alg = match_string(mktme_alg_names,
++					   ARRAY_SIZE(mktme_alg_names),
++					   args[0].from);
++			if (alg < 0){
++				pr_info("mktme_get_options Error. algorithm not supported (match_string). options = %s\n", options);
++				return -EINVAL;
++			}
++
++			/* Algorithm must be activated on this platform */
++			if (!(mktme_algs & (1 << alg))){
++				pr_info("mktme_get_options Error. algorithm not activated. mktme_algs = %d, alg = %d. options = %s\n", mktme_algs, alg, options);
++				return -EINVAL;
++			}
++			break;
++
++		default:
++			pr_info("mktme_get_options Error. default. options = %s\n", options);
++			return -EINVAL;
++		}
++	}
++	return mktme_check_options(payload, token_mask, type, alg);
++}
++
++void mktme_free_preparsed_payload(struct key_preparsed_payload *prep)
++{
++	kfree_sensitive(prep->payload.data[0]);
++}
++
++/*
++ * Key Service Method to preparse a payload before a key is created.
++ * Check permissions and the options. Load the proposed key field
++ * data into the payload for use by the instantiate method.
++ */
++int mktme_preparse_payload(struct key_preparsed_payload *prep)
++{
++	size_t datalen = prep->datalen;
++	u32 *mktme_payload;
++	char *options;
++	int ret;
++
++	if (!capable(CAP_SYS_RESOURCE) && !capable(CAP_SYS_ADMIN)){
++		// return -EACCES;
++		pr_warn("MKTME: TESTING. Ignoring missing CAP_SYS_RESOURCE or CAP_SYS_ADMIN.\n");
++	}
++
++	if (datalen <= 0 || datalen > 1024 || !prep->data)
++		return -EINVAL;
++
++	options = kmemdup_nul(prep->data, datalen, GFP_KERNEL);
++	if (!options)
++		return -ENOMEM;
++
++	mktme_payload = kzalloc(sizeof(*mktme_payload), GFP_KERNEL);
++	if (!mktme_payload) {
++		ret = -ENOMEM;
++		goto out;
++	}
++	ret = mktme_get_options(options, mktme_payload);
++	if (ret < 0) {
++		kfree_sensitive(mktme_payload);
++		goto out;
++	}
++	prep->quotalen = sizeof(mktme_payload);
++	prep->payload.data[0] = mktme_payload;
++out:
++	kfree_sensitive(options);
++	return ret;
++}
++
++struct key_type key_type_mktme = {
++	.name		= "mktme",
++	.preparse	= mktme_preparse_payload,
++	.free_preparse	= mktme_free_preparsed_payload,
++	.instantiate	= mktme_instantiate_key,
++	.describe	= user_describe,
++	.destroy	= mktme_destroy_key,
++};
++
++static void mktme_update_pconfig_targets(void)
++{
++	int cpu, target_id;
++
++	cpumask_clear(mktme_leadcpus);
++	bitmap_clear(mktme_target_map, 0, sizeof(mktme_target_map));
++
++	for_each_online_cpu(cpu) {
++		target_id = topology_physical_package_id(cpu);
++		if (!__test_and_set_bit(target_id, mktme_target_map))
++			__cpumask_set_cpu(cpu, mktme_leadcpus);
++	}
++}
++
++static int mktme_alloc_pconfig_targets(void)
++{
++	if (!alloc_cpumask_var(&mktme_leadcpus, GFP_KERNEL))
++		return -ENOMEM;
++
++	mktme_target_map = bitmap_alloc(topology_max_packages(), GFP_KERNEL);
++	if (!mktme_target_map) {
++		free_cpumask_var(mktme_leadcpus);
++		return -ENOMEM;
++	}
++	return 0;
++}
++
++static int mktme_cpu_teardown(unsigned int cpu)
++{
++	int new_leadcpu, ret = 0;
++	unsigned long flags;
++
++	/* Do not allow key programming during cpu hotplug event */
++	spin_lock_irqsave(&mktme_lock, flags);
++
++	/*
++	 * When no keys are in use, allow the teardown, and set
++	 * mktme_allow_keys to FALSE. That forces an evaluation
++	 * of the topology before the next key creation.
++	 */
++	if (mktme_available_keyids == mktme_nr_keyids()) {
++		mktme_allow_keys = false;
++		goto out;
++	}
++	/* Teardown CPU is not a lead CPU. Allow teardown. */
++	if (!cpumask_test_cpu(cpu, mktme_leadcpus))
++		goto out;
++
++	/* Teardown CPU is a lead CPU. Look for a new lead CPU. */
++	new_leadcpu = cpumask_any_but(topology_core_cpumask(cpu), cpu);
++
++	if (new_leadcpu < nr_cpumask_bits) {
++		/* New lead CPU found. Update the programming mask */
++		__cpumask_clear_cpu(cpu, mktme_leadcpus);
++		__cpumask_set_cpu(new_leadcpu, mktme_leadcpus);
++	} else {
++		/* New lead CPU not found. Do not allow CPU teardown */
++		ret = -1;
++	}
++out:
++	spin_unlock_irqrestore(&mktme_lock, flags);
++	return ret;
++}
++
++static int mktme_memory_callback(struct notifier_block *nb,
++				 unsigned long action, void *arg)
++{
++	/*
++	 * Do not allow the hot add of memory until run time
++	 * support of the ACPI HMAT is available via an _HMA
++	 * method. Without it, the new memory cannot be
++	 * evaluated to determine an MTKME safe topology.
++	 */
++	if (action == MEM_GOING_ONLINE)
++		return NOTIFY_BAD;
++
++	return NOTIFY_OK;
++}
++
++static struct notifier_block mktme_memory_nb = {
++	.notifier_call = mktme_memory_callback,
++	.priority = 99,				/* priority ? */
++};
++
++static int __init init_mktme(void)
++{
++	int ret, cpuhp;
++	pr_info("init_mktme\n");
++
++	/* Verify keys are present */
++	if (mktme_nr_keyids() < 1){
++		pr_warn("MKTME: mktme_nr_keyids() < 1. mktme_nr_keyids = %d\n", mktme_nr_keyids());
++		return 0;
++	}
++
++	mktme_available_keyids = mktme_nr_keyids();
++
++	/* Require an ACPI HMAT to identify MKTME safe topologies */
++	if (!acpi_hmat_present()) {
++		pr_warn("MKTME: Registration failed. ACPI HMAT not present.\n");
++		pr_warn("MKTME: TESTING: ignoring.\n");
++		//TODO ACPI HMAT
++		//return -EINVAL;
++	}
++
++	/* Mapping of Userspace Keys to Hardware KeyIDs */
++	mktme_map = kvzalloc((sizeof(*mktme_map) * (mktme_nr_keyids() + 1)),
++			     GFP_KERNEL);
++	if (!mktme_map){
++		pr_warn("MKTME: kvzalloc failed\n");
++		return -ENOMEM;
++	}
++
++	/* Used to program the hardware key tables */
++	mktme_prog_cache = KMEM_CACHE(mktme_key_program, SLAB_PANIC);
++	if (!mktme_prog_cache){
++		pr_warn("MKTME: KMEM_CACHE(mktme_key_program, SLAB_PANIC) failed\n");
++ 		goto free_map;
++	}
++
++	/* Hardware programming targets */
++	if (mktme_alloc_pconfig_targets()){
++		pr_warn("MKTME: mktme_alloc_pconfig_targets failed\n");
++		goto free_cache;
++	}
++
++	/* Initialize first programming targets */
++	mktme_update_pconfig_targets();
++
++	/* Reference counters to protect in use KeyIDs */
++	encrypt_count = kvcalloc(mktme_nr_keyids() + 1, sizeof(encrypt_count[0]),
++				 GFP_KERNEL);
++	if (!encrypt_count){
++		pr_warn("MKTME: kvcalloc failed\n");
++		goto free_targets;
++	}
++
++	cpuhp = cpuhp_setup_state_nocalls(CPUHP_AP_ONLINE_DYN,
++					  "keys/mktme_keys:online",
++					  NULL, mktme_cpu_teardown);
++	if (cpuhp < 0){
++		pr_warn("MKTME: cpuhp_setup_state_nocalls failed\n");
++		goto free_encrypt;
++	}
++
++	if (register_memory_notifier(&mktme_memory_nb))
++		goto remove_cpuhp;
++
++	ret = register_key_type(&key_type_mktme);
++	pr_info("init_mktme register_key_type = %d\n", ret);
++	if (!ret)
++		return ret;			/* SUCCESS */
++
++	unregister_memory_notifier(&mktme_memory_nb);
++remove_cpuhp:
++	cpuhp_remove_state_nocalls(cpuhp);
++free_encrypt:
++	kvfree(encrypt_count);
++free_targets:
++	free_cpumask_var(mktme_leadcpus);
++	bitmap_free(mktme_target_map);
++free_cache:
++	kmem_cache_destroy(mktme_prog_cache);
++free_map:
++	kvfree(mktme_map);
++
++	return -ENOMEM;
++}
++
++late_initcall(init_mktme);
+diff --git a/tools/include/uapi/asm-generic/mman-common.h b/tools/include/uapi/asm-generic/mman-common.h
+index 1567a3294c3d..3ef35d58f115 100644
+--- a/tools/include/uapi/asm-generic/mman-common.h
++++ b/tools/include/uapi/asm-generic/mman-common.h
+@@ -12,6 +12,7 @@
+ #define PROT_EXEC	0x4		/* page can be executed */
+ #define PROT_SEM	0x8		/* page may be used for atomic ops */
+ /*			0x10		   reserved for arch-specific use */
++#define PROT_TODO	0x10	/* TODO */
+ /*			0x20		   reserved for arch-specific use */
+ #define PROT_NONE	0x0		/* page can not be accessed */
+ #define PROT_GROWSDOWN	0x01000000	/* mprotect flag: extend change to start of growsdown vma */
