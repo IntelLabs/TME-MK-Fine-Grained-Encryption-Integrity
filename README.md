@@ -36,9 +36,6 @@ As a prerequisite, the BIOS/UEFI needs to have TME-MK integrity keys enabled.
 The following guide assumes that we are currently in the directory of this README and that the parent directory is otherwise unused.
 
 ```bash
-# check if correct OS is installed:
-make check_system_requirements
-
 # install required packages
 make package_dependencies
 

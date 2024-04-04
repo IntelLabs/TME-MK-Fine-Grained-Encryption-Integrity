@@ -25,7 +25,6 @@ default:
 .PHONY: package_dependencies
 package_dependencies:
 	sudo apt install git fakeroot build-essential xz-utils libssl-dev bc flex libelf-dev bison libkeyutils-dev keyutils dwarves cmake linux-tools-common msr-tools cgroup-tools libelf-dev libdw-dev clang gawk pkg-config patchelf libbsd-dev autoconf python3-pip
-	pip3 install -r requirements.txt
 # # ------------------------------------------------------------------------------
 CFLAGS += -g -O0 -Wall -Wshadow -Wno-unused-function -Wno-discarded-qualifiers -Wno-unused-variable -Wno-unused-parameter -Wno-unused-but-set-variable -Werror=shadow -fPIC
 
