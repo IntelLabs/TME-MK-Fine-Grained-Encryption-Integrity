@@ -1,5 +1,9 @@
 # TME-MK-i for Memory Safety
 
+This repository contains the proof-of-concept source code for the paper [Memory Tagging using Cryptographic Integrity on Commodity x86 CPUs](https://doi.org/10.1109/EuroSP60621.2024.00024).
+
+The contents of this repository and linked repositories are solely for research purposes and may contain software with vulnerabilities, such as outdated libraries. Do not use in production.
+
 ## Overview
 
 Code consists of 3 parts: glibc, Linux, and PartitionAlloc
